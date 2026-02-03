@@ -21,7 +21,25 @@ load_dotenv()
 
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', 'dev-secret-key-change-in-production')
-app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', 'sqlite:///household.db')
+
+# Configure Database URI
+# Configure Database URI
+import tempfile
+import sys
+
+# Debug logging
+print(f"VERCEL ENV DETECTED: {os.environ.get('VERCEL')}", file=sys.stderr)
+
+if os.environ.get('VERCEL'):
+    # Use /tmp for ephemeral database on Vercel
+    tmp_dir = tempfile.gettempdir()
+    db_path = os.path.join(tmp_dir, 'household.db')
+    print(f"Using ephemeral database at: {db_path}", file=sys.stderr)
+    app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', f'sqlite:///{db_path}')
+else:
+    # Local development
+    app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', 'sqlite:///household.db')
+
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
 
@@ -228,12 +246,12 @@ GOOGLE_CLOUD_PROJECT = os.environ.get('GOOGLE_CLOUD_PROJECT')
 DOCUMENT_AI_LOCATION = os.environ.get('DOCUMENT_AI_LOCATION', 'us')
 DOCUMENT_AI_PROCESSOR_ID = os.environ.get('DOCUMENT_AI_PROCESSOR_ID')
 
-# Credentials path - set via environment variable
+# Credentials path - check
 if credentials_path := os.environ.get('GOOGLE_APPLICATION_CREDENTIALS'):
-    # Environment variable is already set, Google client will use it automatically
     pass
 
-documentai_client = documentai.DocumentProcessorServiceClient()
+def get_documentai_client():
+    return documentai.DocumentProcessorServiceClient()
 
 
 def parse_receipt_with_document_ai(image_bytes):
@@ -241,14 +259,15 @@ def parse_receipt_with_document_ai(image_bytes):
     if not all([GOOGLE_CLOUD_PROJECT, DOCUMENT_AI_PROCESSOR_ID]):
         raise ValueError("Missing required Google Cloud configuration")
     
-    processor_name = documentai_client.processor_path(
+    client = get_documentai_client()
+    processor_name = client.processor_path(
         GOOGLE_CLOUD_PROJECT, DOCUMENT_AI_LOCATION, DOCUMENT_AI_PROCESSOR_ID
     )
 
     raw_document = documentai.RawDocument(content=image_bytes, mime_type="image/jpeg")
     request = documentai.ProcessRequest(name=processor_name, raw_document=raw_document)
 
-    result = documentai_client.process_document(request=request)
+    result = client.process_document(request=request)
     document = result.document
 
     items = []
