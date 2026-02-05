@@ -1,16 +1,268 @@
-{% extends 'base.html' %}
-{% block title %}Chores{% endblock %}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Household Chores</title>
 
-{% block content %}
-<h1>🧹 Chores</h1>
-<p style="color: #666; margin-bottom: 2rem;">{{ group.name }}</p>
+<style>
+/* ------------------ CSS (Combined) ------------------ */
 
-<div class="card">
-    <p style="color: #888; text-align: center; padding: 2rem;">
-        Chore tracking coming soon!<br>
-        <small>Add chores, assign to members, track completion</small>
-    </p>
+body {
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  margin: 0;
+  padding: 0;
+  background: #f5f5f7;
+}
+
+.container {
+  max-width: 800px;
+  margin: 0 auto;
+  padding: 1.5rem;
+}
+
+h1, h2 {
+  margin: 0 0 1rem;
+}
+
+.create-chore, .chore-list {
+  background: #ffffff;
+  border-radius: 8px;
+  padding: 1rem;
+  margin-bottom: 1rem;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+}
+
+.form-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+input[type="text"],
+input[type="date"],
+select {
+  flex: 1 1 150px;
+  padding: 0.5rem;
+  border-radius: 4px;
+  border: 1px solid #ccc;
+}
+
+button {
+  padding: 0.5rem 1rem;
+  border-radius: 4px;
+  border: none;
+  background: #2563eb;
+  color: #fff;
+  cursor: pointer;
+}
+
+button:hover {
+  background: #1d4ed8;
+}
+
+.chore-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  padding: 0.75rem 0;
+  border-bottom: 1px solid #eee;
+}
+
+.chore-item:last-child {
+  border-bottom: none;
+}
+
+.chore-info div {
+  font-size: 0.9rem;
+  color: #555;
+}
+
+.chore-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.hint {
+  font-size: 0.8rem;
+  color: #666;
+  margin-top: 0.5rem;
+}
+
+@media (max-width: 600px) {
+  .chore-item {
+    flex-direction: column;
+    gap: 0.5rem;
+  }
+
+  .form-row {
+    flex-direction: column;
+  }
+
+  button {
+    width: 100%;
+  }
+
+  .chore-actions {
+    width: 100%;
+  }
+}
+</style>
+</head>
+
+<body>
+<div class="container">
+  <h1>Household Chores</h1>
+
+  <section class="create-chore">
+    <h2>Create Chore</h2>
+    <div class="form-row">
+      <input id="chore-name" type="text" placeholder="Chore name" />
+      <input id="chore-due" type="date" />
+      <select id="assigned-users" multiple></select>
+      <button id="add-chore-btn">Add Chore</button>
+    </div>
+    <p class="hint">Hold Ctrl (Cmd on Mac) to select multiple users.</p>
+  </section>
+
+  <section class="chore-list">
+    <h2>Chore List</h2>
+    <div id="chore-list-container"></div>
+  </section>
 </div>
 
-<a href="{{ url_for('home') }}" class="btn btn-secondary mt-2">← Back to Home</a>
-{% endblock %}
+<script>
+/* ------------------ JavaScript (Combined) ------------------ */
+
+const API_BASE = "/api/chores";
+const USERS_API = "/api/users";
+
+const listContainer = document.getElementById("chore-list-container");
+const nameInput = document.getElementById("chore-name");
+const dueInput = document.getElementById("chore-due");
+const addBtn = document.getElementById("add-chore-btn");
+const assignedSelect = document.getElementById("assigned-users");
+
+async function loadUsers() {
+  const res = await fetch(USERS_API);
+  const users = await res.json();
+  assignedSelect.innerHTML = "";
+  users.forEach((u) => {
+    const opt = document.createElement("option");
+    opt.value = u.user_id;
+    opt.textContent = u.name;
+    assignedSelect.appendChild(opt);
+  });
+}
+
+async function fetchChores() {
+  const res = await fetch(API_BASE);
+  const data = await res.json();
+  renderChores(data);
+}
+
+function renderChores(chores) {
+  listContainer.innerHTML = "";
+  if (!chores.length) {
+    listContainer.innerHTML = "<p>No chores yet. Add one above.</p>";
+    return;
+  }
+
+  chores.forEach((chore) => {
+    const div = document.createElement("div");
+    div.className = "chore-item";
+
+    const info = document.createElement("div");
+    info.className = "chore-info";
+
+    const assignedNames = (chore.assignedUsers || [])
+      .map((u) => u.name)
+      .join(", ") || "None";
+
+    const lastCompletedNames = (chore.lastCompletedBy || [])
+      .map((u) => u.name)
+      .join(", ") || "None";
+
+    info.innerHTML = `
+      <strong>${chore.name}</strong>
+      <div>Due: ${chore.nextDueBy || "N/A"}</div>
+      <div>Status: ${chore.completed ? "Completed" : "Pending"}</div>
+      <div>Assigned to: ${assignedNames}</div>
+      <div>Last completed by: ${lastCompletedNames}</div>
+    `;
+
+    const actions = document.createElement("div");
+    actions.className = "chore-actions";
+
+    if (!chore.completed) {
+      const completeBtn = document.createElement("button");
+      completeBtn.textContent = "Mark Completed";
+      completeBtn.onclick = () => completeChore(chore.choreId);
+      actions.appendChild(completeBtn);
+    }
+
+    const autoBtn = document.createElement("button");
+    autoBtn.textContent = "Auto-Assign Next";
+    autoBtn.onclick = () => autoAssignChore(chore.choreId);
+    actions.appendChild(autoBtn);
+
+    div.appendChild(info);
+    div.appendChild(actions);
+    listContainer.appendChild(div);
+  });
+}
+
+function getSelectedAssignedUserIds() {
+  return Array.from(assignedSelect.selectedOptions).map((opt) =>
+    parseInt(opt.value, 10)
+  );
+}
+
+async function createChore() {
+  const name = nameInput.value.trim();
+  const nextDueBy = dueInput.value || null;
+  const assignedUserIds = getSelectedAssignedUserIds();
+
+  if (!name) return;
+
+  const res = await fetch(API_BASE, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name, nextDueBy, assignedUserIds }),
+  });
+
+  if (res.ok) {
+    nameInput.value = "";
+    dueInput.value = "";
+    assignedSelect.selectedIndex = -1;
+    await fetchChores();
+  }
+}
+
+async function completeChore(choreId) {
+  const res = await fetch(`${API_BASE}/${choreId}/complete`, {
+    method: "POST",
+  });
+  if (res.ok) {
+    await fetchChores();
+  }
+}
+
+async function autoAssignChore(choreId) {
+  const res = await fetch(`${API_BASE}/${choreId}/auto-assign`, {
+    method: "POST",
+  });
+  if (res.ok) {
+    await fetchChores();
+  }
+}
+
+addBtn.addEventListener("click", createChore);
+
+// near real-time sync
+loadUsers().then(fetchChores);
+setInterval(fetchChores, 3000);
+</script>
+
+</body>
+</html>
