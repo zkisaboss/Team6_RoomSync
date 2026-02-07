@@ -712,7 +712,6 @@ def payments():
 
 
 
-
 # Init
 with app.app_context():
     db.create_all()
