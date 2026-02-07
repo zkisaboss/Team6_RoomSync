@@ -3,48 +3,31 @@ from flask_sqlalchemy import SQLAlchemy
 from werkzeug.security import generate_password_hash, check_password_hash
 from functools import wraps
 from sqlalchemy.exc import IntegrityError
-import secrets
+
 import os
 import sys
-
+import secrets
 import stripe
-from dotenv import load_dotenv
+import json
+import base64
+import re
+import io
 
 from datetime import datetime, date
+from dotenv import load_dotenv
 from PIL import Image
-import io
-import re
-import base64
 import anthropic
-import json
 
+# Load environment variables
 load_dotenv()
-stripe.api_key = os.environ.get("STRIPE_SECRET_KEY")
 
+stripe.api_key = os.environ.get("STRIPE_SECRET_KEY")
 print("Stripe key loaded:", stripe.api_key)
 print("STRIPE KEY starts with:", (stripe.api_key or "")[:12])
 
-from datetime import datetime, date
-from PIL import Image
-import io
-import re
-import base64
-
-import os
-from dotenv import load_dotenv
-
-import anthropic
-import json
-import sys
-
-
-
-# Load environment variables from .env file
-load_dotenv()
-
-
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', 'dev-secret-key-change-in-production')
+
 
 # Database Configuration
 database_url = os.environ.get('POSTGRES_URL') or os.environ.get('DATABASE_URL')
@@ -94,7 +77,6 @@ class Payment(db.Model):
     stripe_payment_intent_id = db.Column(db.String(255), nullable=True)
 
     created_at = db.Column(db.DateTime, server_default=db.func.now())
-
 
 
 
@@ -392,6 +374,7 @@ def groceries():
 # Grocery Receipt OCR - Anthropic Claude
 
 
+
 ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY')
 
 def parse_receipt_with_claude(image_bytes):
@@ -605,6 +588,7 @@ def modify_grocery(item_id):
 
 
 # Chores API Routes
+
 
 
 def chore_to_dict(chore):

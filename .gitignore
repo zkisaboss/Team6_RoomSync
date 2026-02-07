@@ -22,7 +22,7 @@ pip-delete-this-directory.txt
 # macOS
 .DS_Store
 
-# Database
+# Databaset
 *.db
 *.sqlite3
 
