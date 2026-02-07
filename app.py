@@ -1,21 +1,14 @@
 from flask import Flask, render_template, request, redirect, url_for, flash, session, jsonify
-
-
 from flask_sqlalchemy import SQLAlchemy
 from werkzeug.security import generate_password_hash, check_password_hash
 from functools import wraps
 from sqlalchemy.exc import IntegrityError
 import secrets
 import os
+import sys
+
 import stripe
 from dotenv import load_dotenv
-
-
-load_dotenv()
-stripe.api_key = os.environ.get("STRIPE_SECRET_KEY")
-print("Stripe key loaded:", stripe.api_key)
-print("STRIPE KEY starts with:", (stripe.api_key or "")[:12])
-
 
 from datetime import datetime, date
 from PIL import Image
@@ -24,7 +17,30 @@ import re
 import base64
 import anthropic
 import json
+
+load_dotenv()
+stripe.api_key = os.environ.get("STRIPE_SECRET_KEY")
+
+print("Stripe key loaded:", stripe.api_key)
+print("STRIPE KEY starts with:", (stripe.api_key or "")[:12])
+
+from datetime import datetime, date
+from PIL import Image
+import io
+import re
+import base64
+
+import os
+from dotenv import load_dotenv
+
+import anthropic
+import json
 import sys
+
+
+
+# Load environment variables from .env file
+load_dotenv()
 
 
 app = Flask(__name__)
@@ -78,6 +94,9 @@ class Payment(db.Model):
     stripe_payment_intent_id = db.Column(db.String(255), nullable=True)
 
     created_at = db.Column(db.DateTime, server_default=db.func.now())
+
+
+
 
 class GroceryItem(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -476,9 +495,8 @@ def ensure_jpeg_bytes(image_bytes):
     return buffer.getvalue()
 
 
-# =============================================================================
 # Grocery API Routes
-# =============================================================================
+
 
 @app.route('/groceries/upload', methods=['POST'])
 @login_required
@@ -586,9 +604,8 @@ def modify_grocery(item_id):
     return jsonify({'updated': True})
 
 
-# =============================================================================
 # Chores API Routes
-# =============================================================================
+
 
 def chore_to_dict(chore):
     return {
@@ -698,6 +715,7 @@ def auto_assign_chore_route(chore_id):
     return jsonify(chore_to_dict(chore))
 
 
+
 @app.route("/payments")
 @login_required
 def payments():
@@ -707,6 +725,7 @@ def payments():
     if redirect_response := require_group(user):
         return redirect_response
     return render_template("payments.html", group=user.group)
+
 
 
 

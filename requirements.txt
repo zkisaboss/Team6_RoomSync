@@ -1,4 +1,4 @@
-<<<<<<< HEAD
+
 blinker==1.9.0
 certifi==2026.1.4
 charset-normalizer==3.4.4
@@ -16,12 +16,6 @@ stripe==14.3.0
 typing_extensions==4.15.0
 urllib3==2.6.3
 Werkzeug==3.1.5
-=======
-flask
-flask_sqlalchemy
-python-dotenv
-Pillow
-anthropic
-werkzeug
-psycopg2-binary
->>>>>>> 60547a26854950cf0724aa4d763f00a75be5d207
+
+
+
