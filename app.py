@@ -1,22 +1,50 @@
-from flask import (
-    Flask,
-    render_template,
-    request,
-    redirect,
-    url_for,
-    flash,
-    session
-)
+from flask import Flask, render_template, request, redirect, url_for, flash, session, jsonify
+
+
 from flask_sqlalchemy import SQLAlchemy
 from werkzeug.security import generate_password_hash, check_password_hash
 from functools import wraps
 from sqlalchemy.exc import IntegrityError
 import secrets
+import os
+import stripe
+from dotenv import load_dotenv
+
+
+load_dotenv()
+stripe.api_key = os.environ.get("STRIPE_SECRET_KEY")
+print("Stripe key loaded:", stripe.api_key)
+print("STRIPE KEY starts with:", (stripe.api_key or "")[:12])
+
+
+from datetime import datetime, date
+from PIL import Image
+import io
+import re
+import base64
+import anthropic
+import json
+import sys
+
 
 app = Flask(__name__)
-app.secret_key = secrets.token_hex(32)
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///household.db'
+app.secret_key = os.environ.get('SECRET_KEY', 'dev-secret-key-change-in-production')
+
+# Database Configuration
+database_url = os.environ.get('POSTGRES_URL') or os.environ.get('DATABASE_URL')
+
+if not database_url:
+    raise ValueError("Missing POSTGRES_URL or DATABASE_URL environment variable")
+
+# Fix incompatible postgres:// scheme for SQLAlchemy if present
+if database_url.startswith('postgres://'):
+    database_url = database_url.replace('postgres://', 'postgresql://', 1)
+
+app.config['SQLALCHEMY_DATABASE_URI'] = database_url
+print(f"Using database: {database_url.split('@')[0]}...", file=sys.stderr)
+
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
 
 db = SQLAlchemy(app)
 
@@ -24,8 +52,7 @@ db = SQLAlchemy(app)
 # Models
 class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    email = db.Column(db.String(120), unique=True, nullable=False,
-                      index=True)
+    email = db.Column(db.String(120), unique=True, nullable=False, index=True)
     password = db.Column(db.String(200), nullable=False)
     group_id = db.Column(db.Integer, db.ForeignKey('group.id'))
 
@@ -35,6 +62,60 @@ class Group(db.Model):
     name = db.Column(db.String(100), nullable=False)
     code = db.Column(db.String(8), unique=True, nullable=False, index=True)
     users = db.relationship('User', backref='group', lazy='dynamic')
+
+class Payment(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
+    group_id = db.Column(db.Integer, db.ForeignKey("group.id"), nullable=False)
+
+    amount_cents = db.Column(db.Integer, nullable=False)
+    currency = db.Column(db.String(10), nullable=False, default="usd")
+
+    status = db.Column(db.String(30), nullable=False, default="pending")
+
+    stripe_session_id = db.Column(db.String(255), unique=True, nullable=False)
+    stripe_payment_intent_id = db.Column(db.String(255), nullable=True)
+
+    created_at = db.Column(db.DateTime, server_default=db.func.now())
+
+class GroceryItem(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(200), nullable=False)
+    quantity = db.Column(db.Integer, default=1)
+    price = db.Column(db.Float, nullable=True)
+    purchased = db.Column(db.Boolean, default=False)
+    group_id = db.Column(db.Integer, db.ForeignKey('group.id'), nullable=False)
+
+
+# Association table for ChoreAssignments
+chore_assignments = db.Table('chore_assignments',
+    db.Column('user_id', db.Integer, db.ForeignKey('user.id'), primary_key=True),
+    db.Column('chore_id', db.Integer, db.ForeignKey('chore.id'), primary_key=True)
+)
+
+
+class Chore(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(200), nullable=False)
+    next_due_date = db.Column(db.Date, nullable=True)
+    completed = db.Column(db.Boolean, default=False)
+    group_id = db.Column(db.Integer, db.ForeignKey('group.id'), nullable=False)
+    created_by_id = db.Column(db.Integer, db.ForeignKey('user.id'))
+
+    # Relationships
+    assignments = db.relationship('User', secondary=chore_assignments, lazy='subquery',
+        backref=db.backref('assigned_chores', lazy=True))
+    completions = db.relationship('ChoreCompletion', backref='chore', lazy=True, cascade="all, delete-orphan")
+
+
+class ChoreCompletion(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    chore_id = db.Column(db.Integer, db.ForeignKey('chore.id'), nullable=False)
+    completed_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    user = db.relationship('User', backref='chore_completions')
 
 
 # Auth helpers
@@ -57,7 +138,6 @@ def get_current_user():
 
 
 def require_group(user):
-    """Redirect if user lacks group membership."""
     return None if user.group_id else redirect(url_for('group'))
 
 
@@ -67,19 +147,14 @@ def login():
     if request.method == 'POST':
         email = request.form.get('email', '').strip().lower()
         password = request.form.get('password', '')
-
         if not email or not password:
             flash('Email and password required')
             return render_template('login.html')
-
         user = User.query.filter_by(email=email).first()
         if user and check_password_hash(user.password, password):
             session['user_id'] = user.id
-            redirect_url = (url_for('home') if user.group_id else url_for('group'))
-            return redirect(redirect_url)
-
+            return redirect(url_for('home') if user.group_id else url_for('group'))
         flash('Invalid credentials')
-
     return render_template('login.html')
 
 
@@ -88,15 +163,12 @@ def register():
     if request.method == 'POST':
         email = request.form.get('email', '').strip().lower()
         password = request.form.get('password', '')
-
         if not email or not password:
             flash('Email and password required')
             return render_template('register.html')
-
         if len(password) < 6:
             flash('Password must be at least 6 characters')
             return render_template('register.html')
-
         user = User(email=email, password=generate_password_hash(password))
         try:
             db.session.add(user)
@@ -106,7 +178,6 @@ def register():
         except IntegrityError:
             db.session.rollback()
             flash('Email already exists')
-
     return render_template('register.html')
 
 
@@ -114,6 +185,92 @@ def register():
 def logout():
     session.clear()
     return redirect(url_for('login'))
+
+@app.route("/payments/create-checkout-session", methods=["POST"])
+@login_required
+def create_checkout_session():
+    user = get_current_user()
+    if not user or not user.group_id:
+        flash("You must be in a group to pay.")
+        return redirect(url_for("payments"))
+
+    amount_cents = int(request.form.get("amount_cents", "500"))
+
+    base_url = os.environ.get("BASE_URL", request.host_url.rstrip("/"))
+
+    checkout_session = stripe.checkout.Session.create(
+        mode="payment",
+        line_items=[{
+            "price_data": {
+                "currency": "usd",
+                "product_data": {"name": "RoomSync payment"},
+                "unit_amount": amount_cents,
+            },
+            "quantity": 1,
+        }],
+        success_url=f"{base_url}/payments/success?session_id={{CHECKOUT_SESSION_ID}}",
+        cancel_url=f"{base_url}/payments/cancel",
+        metadata={
+            "user_id": str(user.id),
+            "group_id": str(user.group_id),
+        },
+    )
+
+
+    # Save a "pending" record now 
+    p = Payment(
+        user_id=user.id,
+        group_id=user.group_id,
+        amount_cents=amount_cents,
+        currency="usd",
+        status="pending",
+        stripe_session_id=checkout_session.id
+    )
+    db.session.add(p)
+    db.session.commit()
+
+    return redirect(checkout_session.url, code=303)
+
+@app.route("/payments/success")
+@login_required
+def payments_success():
+    session_id = request.args.get("session_id")
+    return render_template("payment_success.html", session_id=session_id)
+
+@app.route("/payments/cancel")
+@login_required
+def payments_cancel():
+    return render_template("payment_cancel.html")
+
+
+@app.route("/payments/webhook", methods=["POST"])
+def stripe_webhook():
+    payload = request.get_data()
+    sig_header = request.headers.get("Stripe-Signature")
+    endpoint_secret = os.environ.get("STRIPE_WEBHOOK_SECRET")
+
+    try:
+        event = stripe.Webhook.construct_event(
+            payload=payload, sig_header=sig_header, secret=endpoint_secret
+        )
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+    if event["type"] == "checkout.session.completed":
+        s = event["data"]["object"]
+        session_id = s["id"]
+        payment_intent_id = s.get("payment_intent")
+
+        # Find the pending record and mark confirmed
+        p = Payment.query.filter_by(stripe_session_id=session_id).first()
+        if p:
+            p.status = "confirmed"
+            p.stripe_payment_intent_id = payment_intent_id
+            db.session.commit()
+
+    return jsonify({"received": True}), 200
+
+
 
 
 # Group management
@@ -123,18 +280,14 @@ def group():
     user = get_current_user()
     if not user:
         return redirect(url_for('login'))
-
     if user.group_id:
         return redirect(url_for('home'))
-
     if request.method == 'POST':
         action = request.form.get('action')
-
         if action == 'create':
             return handle_create_group(user)
         elif action == 'join':
             return handle_join_group(user)
-
     return render_template('group.html')
 
 
@@ -143,11 +296,9 @@ def handle_create_group(user):
     if not name:
         flash('Group name required')
         return render_template('group.html')
-
     for _ in range(5):
         code = secrets.token_hex(4).upper()
         new_group = Group(name=name, code=code)
-
         try:
             db.session.add(new_group)
             db.session.flush()
@@ -157,7 +308,6 @@ def handle_create_group(user):
             return redirect(url_for('home'))
         except IntegrityError:
             db.session.rollback()
-
     flash('Failed to create group, try again')
     return render_template('group.html')
 
@@ -167,12 +317,10 @@ def handle_join_group(user):
     if not code:
         flash('Group code required')
         return render_template('group.html')
-
     target_group = Group.query.filter_by(code=code).first()
     if not target_group:
         flash('Invalid code')
         return render_template('group.html')
-
     try:
         user.group_id = target_group.id
         db.session.commit()
@@ -215,7 +363,351 @@ def groceries():
         return redirect(url_for('login'))
     if redirect_response := require_group(user):
         return redirect_response
-    return render_template('groceries.html', group=user.group)
+    items = GroceryItem.query.filter_by(group_id=user.group_id).order_by(
+        GroceryItem.purchased, GroceryItem.id.desc()
+    ).all()
+    return render_template('groceries.html', group=user.group, items=items)
+
+
+
+# Grocery Receipt OCR - Anthropic Claude
+
+
+ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY')
+
+def parse_receipt_with_claude(image_bytes):
+    """Parse receipt image using Anthropic Claude."""
+    if not ANTHROPIC_API_KEY:
+        raise ValueError("Missing ANTHROPIC_API_KEY environment variable")
+    
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    
+    # Encode image to base64
+    image_base64 = base64.b64encode(image_bytes).decode('utf-8')
+    
+    prompt = """
+    Extract grocery items as JSON: {"items": [...]}
+    
+    Each item:
+    - "name": item name only (exclude codes/quantities)
+    - "amt": quantity (parse from EA/QTY/@, default 1)
+    - "price": line total (not unit price)
+    
+    Ignore tax/subtotals. JSON only.
+    """
+
+    # Model selection
+    CLAUDE_HAIKU = "claude-haiku-4-5-20251001"    # $1/$5 - Fastest, cheapest
+    CLAUDE_SONNET = "claude-sonnet-4-5-20250929"  # $3/$15 - Balanced (recommended)
+    CLAUDE_OPUS = "claude-opus-4-5-20251101"      # $5/$25 - Highest accuracy
+
+    message = client.messages.create(
+        model=CLAUDE_SONNET,
+        max_tokens=2048,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/jpeg",
+                            "data": image_base64,
+                        },
+                    },
+                    {
+                        "type": "text",
+                        "text": prompt
+                    }
+                ],
+            }
+        ],
+    )
+
+    # Extract JSON from response
+    response_text = message.content[0].text
+    try:
+        # Simple extraction in case Claude adds some text
+        json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+        if json_match:
+            data = json.loads(json_match.group())
+            raw_items = data.get('items', [])
+            
+            # Map 'amt' back to 'quantity' for internal app consistency
+            items = []
+            for item in raw_items:
+                items.append({
+                    'name': item.get('name', ''),
+                    'quantity': item.get('amt', 1),
+                    'price': item.get('price')
+                })
+            return items
+        else:
+            return []
+    except Exception as e:
+        print(f"Error parsing Claude response: {e}", file=sys.stderr)
+        return []
+
+
+def extract_image_from_request():
+    """Extract image bytes from file upload or base64 JSON request."""
+    if 'receipt' in request.files:
+        file = request.files['receipt']
+        if file.filename:
+            return file.read()
+    elif request.is_json:
+        data = request.get_json()
+        if 'image' in data:
+            img_data = data['image']
+            if ',' in img_data:
+                img_data = img_data.split(',')[1]
+            return base64.b64decode(img_data)
+    return None
+
+
+def ensure_jpeg_bytes(image_bytes):
+    """Convert image bytes to JPEG format for Gemini API."""
+    image = Image.open(io.BytesIO(image_bytes))
+    if image.mode in ('RGBA', 'P'):
+        image = image.convert('RGB')
+    buffer = io.BytesIO()
+    image.save(buffer, format='JPEG')
+    return buffer.getvalue()
+
+
+# =============================================================================
+# Grocery API Routes
+# =============================================================================
+
+@app.route('/groceries/upload', methods=['POST'])
+@login_required
+def upload_receipt():
+    user = get_current_user()
+    if not user or not user.group_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    try:
+        image_bytes = extract_image_from_request()
+        if not image_bytes:
+            return jsonify({'error': 'No image provided'}), 400
+
+        image_bytes = ensure_jpeg_bytes(image_bytes)
+        items = parse_receipt_with_claude(image_bytes)
+
+        return jsonify({'items': items})
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/groceries/add', methods=['POST'])
+@login_required
+def add_grocery():
+    user = get_current_user()
+    if not user or not user.group_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    data = request.get_json()
+    name = data.get('name', '').strip()
+    if not name:
+        return jsonify({'error': 'Name required'}), 400
+
+    item = GroceryItem(
+        name=name,
+        quantity=data.get('quantity', 1),
+        price=data.get('price'),
+        group_id=user.group_id
+    )
+    db.session.add(item)
+    db.session.commit()
+
+    return jsonify({
+        'id': item.id, 'name': item.name,
+        'quantity': item.quantity, 'price': item.price
+    })
+
+
+@app.route('/groceries/bulk-add', methods=['POST'])
+@login_required
+def bulk_add_groceries():
+    user = get_current_user()
+    if not user or not user.group_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    data = request.get_json()
+    items_data = data.get('items', [])
+
+    added = []
+    for item_data in items_data:
+        if name := item_data.get('name', '').strip():
+            item = GroceryItem(
+                name=name,
+                quantity=item_data.get('quantity', 1),
+                price=item_data.get('price'),
+                group_id=user.group_id
+            )
+            db.session.add(item)
+            added.append(item)
+
+    db.session.commit()
+    return jsonify({'added': len(added)})
+
+
+@app.route('/groceries/<int:item_id>', methods=['PUT', 'DELETE'])
+@login_required
+def modify_grocery(item_id):
+    user = get_current_user()
+    if not user or not user.group_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    item = GroceryItem.query.filter_by(id=item_id, group_id=user.group_id).first()
+    if not item:
+        return jsonify({'error': 'Item not found'}), 404
+
+    if request.method == 'DELETE':
+        db.session.delete(item)
+        db.session.commit()
+        return jsonify({'deleted': True})
+
+    data = request.get_json()
+    if 'name' in data:
+        item.name = data['name']
+    if 'quantity' in data:
+        item.quantity = data['quantity']
+    if 'price' in data:
+        item.price = data['price']
+    if 'purchased' in data:
+        item.purchased = data['purchased']
+
+    db.session.commit()
+    return jsonify({'updated': True})
+
+
+# =============================================================================
+# Chores API Routes
+# =============================================================================
+
+def chore_to_dict(chore):
+    return {
+        "choreId": chore.id,
+        "name": chore.name,
+        "assignedUsers": [
+            {"user_id": u.id, "name": u.email.split('@')[0]} for u in chore.assignments
+        ],
+        "lastCompletedBy": [
+            {"user_id": c.user.id, "name": c.user.email.split('@')[0]} 
+            for c in sorted(chore.completions, key=lambda x: x.completed_at, reverse=True)
+        ],
+        "createdBy": (
+            {"user_id": chore.created_by_id, "name": "User"} 
+            if chore.created_by_id else None
+        ),
+        "nextDueBy": chore.next_due_date.isoformat() if chore.next_due_date else None,
+        "completed": chore.completed,
+    }
+
+@app.route("/api/users", methods=["GET"])
+@login_required
+def get_users():
+    user = get_current_user()
+    if not user or not user.group_id:
+        return jsonify([])
+    
+    group_users = User.query.filter_by(group_id=user.group_id).all()
+    return jsonify([{"user_id": u.id, "name": u.email.split('@')[0]} for u in group_users])
+
+@app.route("/api/chores", methods=["GET", "POST"])
+@login_required
+def chores_api():
+    user = get_current_user()
+    if not user or not user.group_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+        
+    if request.method == "GET":
+        chores = Chore.query.filter_by(group_id=user.group_id).order_by(Chore.completed, Chore.next_due_date).all()
+        return jsonify([chore_to_dict(c) for c in chores])
+
+    data = request.get_json()
+    name = data.get("name", "").strip()
+    next_due_str = data.get("nextDueBy")
+    assigned_ids = data.get("assignedUserIds", [])
+
+    if not name:
+        return jsonify({"error": "name is required"}), 400
+
+    next_due = date.fromisoformat(next_due_str) if next_due_str else None
+    
+    assigned_users = User.query.filter(User.id.in_(assigned_ids), User.group_id == user.group_id).all()
+
+    chore = Chore(
+        name=name,
+        group_id=user.group_id,
+        created_by_id=user.id,
+        next_due_date=next_due,
+        completed=False
+    )
+    chore.assignments.extend(assigned_users)
+    
+    db.session.add(chore)
+    db.session.commit()
+    
+    return jsonify(chore_to_dict(chore)), 201
+
+@app.route("/api/chores/<int:chore_id>/complete", methods=["POST"])
+@login_required
+def complete_chore_route(chore_id):
+    user = get_current_user()
+    if not user or not user.group_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+        
+    chore = Chore.query.filter_by(id=chore_id, group_id=user.group_id).first()
+    if not chore:
+        return jsonify({"error": "chore not found"}), 404
+        
+    chore.completed = True
+    
+    completion = ChoreCompletion(user_id=user.id, chore_id=chore.id)
+    db.session.add(completion)
+    
+    db.session.commit()
+    return jsonify(chore_to_dict(chore))
+
+@app.route("/api/chores/<int:chore_id>/auto-assign", methods=["POST"])
+@login_required
+def auto_assign_chore_route(chore_id):
+    user = get_current_user()
+    if not user or not user.group_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+        
+    chore = Chore.query.filter_by(id=chore_id, group_id=user.group_id).first()
+    if not chore:
+        return jsonify({"error": "chore not found"}), 404
+
+    if chore.assignments:
+        users = list(chore.assignments)
+        first = users.pop(0)
+        users.append(first)
+        chore.assignments = users
+        
+    chore.completed = False
+    db.session.commit()
+    
+    return jsonify(chore_to_dict(chore))
+
+
+@app.route("/payments")
+@login_required
+def payments():
+    user = get_current_user()
+    if not user:
+        return redirect(url_for("login"))
+    if redirect_response := require_group(user):
+        return redirect_response
+    return render_template("payments.html", group=user.group)
+
 
 
 # Init
@@ -223,4 +715,4 @@ with app.app_context():
     db.create_all()
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run(debug=True, port=5001)

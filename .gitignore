@@ -1,0 +1,32 @@
+.env
+venv/
+__pycache__/
+*.pyc
+
+instance/household.db
+# Secrets
+.env
+
+# Python
+instance/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# macOS
+.DS_Store
+
+# Database
+*.db
+*.sqlite3
+
+# IDE
+.vscode/
+.idea/
+.vercel
