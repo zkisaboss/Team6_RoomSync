@@ -14,7 +14,7 @@ from functools import wraps
 from flask import Flask, render_template, request, redirect, url_for, flash, session, jsonify, g
 from flask_sqlalchemy import SQLAlchemy
 from flask_mail import Mail, Message
-from sqlalchemy.orm import relationship
+from sqlalchemy.orm import relationship, joinedload
 from sqlalchemy.exc import IntegrityError
 from werkzeug.security import generate_password_hash, check_password_hash
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps
@@ -143,7 +143,7 @@ class ChoreCompletion(db.Model):
 class Notification(db.Model):
     __tablename__ = 'notifications'
     id = db.Column(db.Integer, primary_key=True)
-    users_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
     group_id = db.Column(db.Integer, db.ForeignKey('groups.id'), nullable=False)
     type = db.Column(db.String(50), nullable=False)
     title = db.Column(db.String(200), nullable=False)
@@ -151,7 +151,7 @@ class Notification(db.Model):
     is_read = db.Column(db.Boolean, default=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     related_id = db.Column(db.Integer, nullable=True)
-    users = relationship('User', backref='notifications')
+    user = relationship('User', backref='notifications')
 
 
 class Expense(db.Model):
@@ -427,35 +427,6 @@ def check_and_send_weekly_reminders():
             db.session.rollback()
 
 
-        try:
-            conn.execute(db.text(
-                "CREATE TABLE IF NOT EXISTS group_members ("
-                "id INTEGER PRIMARY KEY, "
-                "group_id INTEGER NOT NULL, "
-                "user_id INTEGER NOT NULL, "
-                "role TEXT NOT NULL DEFAULT 'member'"
-                ")"
-            ))
-            conn.commit()
-        except Exception:
-            conn.rollback()
-
-
-        try:
-            conn.execute(db.text(
-                "CREATE TABLE IF NOT EXISTS group_invites ("
-                "id INTEGER PRIMARY KEY, "
-                "email TEXT NOT NULL, "
-                "group_id INTEGER NOT NULL, "
-                "code TEXT NOT NULL, "
-                "accepted BOOLEAN DEFAULT FALSE"
-                ")"
-            ))
-            conn.commit()
-        except Exception:
-            conn.rollback()
-
-
 # =============================================================================
 # SCHEDULER
 # =============================================================================
@@ -490,7 +461,6 @@ def parse_receipt_with_claude(image_bytes):
     Each item:
     - "name": item name only (exclude codes/quantities)
     - "amt": quantity (parse from EA/QTY/@, default 1)
-    - "price": line total (not unit price)
     - "unit_price": price per single unit
     - "price": line total (qty × unit_price)
 
@@ -1061,6 +1031,9 @@ def chores_api():
     if request.method == "GET":
         all_chores = Chore.query.filter_by(group_id=user.group_id).order_by(
             Chore.completed, Chore.next_due_date
+        ).options(
+            joinedload(Chore.assignments),
+            joinedload(Chore.completions).joinedload(ChoreCompletion.user),
         ).all()
         return jsonify([chore_to_dict(c) for c in all_chores])
 
@@ -1182,6 +1155,10 @@ def get_expenses():
 
     all_expenses = Expense.query.filter_by(group_id=user.group_id).order_by(
         Expense.date.desc(), Expense.created_at.desc()
+    ).options(
+        joinedload(Expense.paid_by),
+        joinedload(Expense.splits).joinedload(ExpenseSplit.user),
+        joinedload(Expense.payments),
     ).all()
 
     return jsonify([{
@@ -1611,7 +1588,6 @@ def delete_account():
 
     # Clean up group membership and notifications before deleting
     if user.group_id:
-        from sqlalchemy import text as sa_text
         membership = GroupMember.query.filter_by(group_id=user.group_id, user_id=user.id).first()
         if membership:
             db.session.delete(membership)
@@ -1674,7 +1650,9 @@ def mark_all_read():
 def get_payments_summary():
     user = g.user
 
-    expenses = Expense.query.filter_by(group_id=user.group_id).all()
+    expenses = Expense.query.filter_by(group_id=user.group_id).options(
+        joinedload(Expense.splits)
+    ).all()
 
     you_owe = 0.0
     you_are_owed = 0.0
