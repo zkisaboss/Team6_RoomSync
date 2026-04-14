@@ -7,6 +7,7 @@ import json
 import base64
 import io
 import atexit
+import requests as http_requests
 
 from datetime import datetime, date, timedelta
 from functools import wraps
@@ -60,6 +61,8 @@ stripe.api_key = os.environ.get("STRIPE_SECRET_KEY")
 ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY')
 BASE_URL = os.environ.get('BASE_URL', 'http://localhost:5000')
 GOOGLE_CLIENT_ID = os.environ.get('NEXT_PUBLIC_GOOGLE_CLIENT_ID') or os.environ.get('GOOGLE_CLIENT_ID', '')
+GOOGLE_CLIENT_SECRET = os.environ.get('GOOGLE_CLIENT_SECRET', '')
+GOOGLE_REDIRECT_URI = os.environ.get('GOOGLE_REDIRECT_URI', f'{os.environ.get("BASE_URL", "http://localhost:5000")}/auth/google/callback')
 
 
 # =============================================================================
@@ -567,18 +570,6 @@ def preprocess_receipt_image(image_bytes):
 # AUTH ROUTES
 # =============================================================================
 
-@app.route('/debug-auth')
-def debug_auth():
-    """Temporary: confirms env vars are loaded. REMOVE AFTER FIXING."""
-    client_id = GOOGLE_CLIENT_ID
-    return jsonify({
-        'google_client_id_set': bool(client_id),
-        'google_client_id_preview': client_id[:20] + '...' if len(client_id) > 20 else client_id,
-        'env_var_NEXT_PUBLIC': bool(os.environ.get('NEXT_PUBLIC_GOOGLE_CLIENT_ID')),
-        'env_var_GOOGLE_CLIENT_ID': bool(os.environ.get('GOOGLE_CLIENT_ID')),
-    })
-
-
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     if request.method == 'POST':
@@ -586,45 +577,101 @@ def login():
         password = request.form.get('password', '')
         if not email or not password:
             flash('Email and password required')
-            return render_template('login.html', google_client_id=GOOGLE_CLIENT_ID)
+            return render_template('login.html')
         user = User.query.filter_by(email=email).first()
         if user and user.password and check_password_hash(user.password, password):
             session['user_id'] = user.id
             return redirect(url_for('home') if user.group_id else url_for('group'))
         flash('Invalid credentials')
-    return render_template('login.html', google_client_id=GOOGLE_CLIENT_ID)
+    return render_template('login.html')
 
 
-@app.route('/auth/google', methods=['POST'])
-def auth_google():
-    """Handle Google Sign-In callback."""
-    token = request.form.get('credential')
-    if not token:
+@app.route('/auth/google')
+def auth_google_start():
+    """Step 1: Redirect the user to Google's OAuth2 consent screen."""
+    if not GOOGLE_CLIENT_ID:
+        flash('Google login is not configured')
+        return redirect(url_for('login'))
+    state = secrets.token_urlsafe(16)
+    session['oauth_state'] = state
+    params = {
+        'client_id': GOOGLE_CLIENT_ID,
+        'redirect_uri': GOOGLE_REDIRECT_URI,
+        'response_type': 'code',
+        'scope': 'openid email profile',
+        'state': state,
+        'access_type': 'online',
+    }
+    query = '&'.join(f'{k}={http_requests.utils.quote(str(v))}' for k, v in params.items())
+    return redirect(f'https://accounts.google.com/o/oauth2/v2/auth?{query}')
+
+
+@app.route('/auth/google/callback')
+def auth_google_callback():
+    """Step 2: Google redirects here with an authorization code."""
+    error = request.args.get('error')
+    if error:
+        flash(f'Google login cancelled: {error}')
+        return redirect(url_for('login'))
+
+    # CSRF check
+    state = request.args.get('state', '')
+    if state != session.pop('oauth_state', None):
+        flash('Invalid OAuth state — please try again')
+        return redirect(url_for('login'))
+
+    code = request.args.get('code')
+    if not code:
+        flash('Google authentication failed: no code received')
+        return redirect(url_for('login'))
+
+    # Exchange the code for tokens
+    try:
+        token_resp = http_requests.post(
+            'https://oauth2.googleapis.com/token',
+            data={
+                'code': code,
+                'client_id': GOOGLE_CLIENT_ID,
+                'client_secret': GOOGLE_CLIENT_SECRET,
+                'redirect_uri': GOOGLE_REDIRECT_URI,
+                'grant_type': 'authorization_code',
+            },
+            timeout=10,
+        )
+        token_resp.raise_for_status()
+        tokens = token_resp.json()
+    except Exception as e:
+        print(f'Google token exchange error: {e}', file=sys.stderr)
         flash('Google authentication failed')
         return redirect(url_for('login'))
+
+    # Verify and decode the ID token
     try:
         idinfo = google_id_token.verify_oauth2_token(
-            token, google_requests.Request(), GOOGLE_CLIENT_ID
+            tokens['id_token'], google_requests.Request(), GOOGLE_CLIENT_ID
         )
         email = idinfo['email'].strip().lower()
         google_name = idinfo.get('name', '').strip()
-        user = User.query.filter_by(email=email).first()
-        if not user:
-            user = User(
-                email=email, password=None, auth_provider='google',
-                username=google_name or email.split('@')[0]
-            )
-            db.session.add(user)
-            db.session.commit()
-        elif not user.username and google_name:
-            user.username = google_name
-            db.session.commit()
-        session['user_id'] = user.id
-        return redirect(url_for('home') if user.group_id else url_for('group'))
     except Exception as e:
-        print(f'Google auth error: {e}', file=sys.stderr)
+        print(f'Google ID token verification error: {e}', file=sys.stderr)
         flash('Google authentication failed')
         return redirect(url_for('login'))
+
+    # Find or create the user
+    user = User.query.filter_by(email=email).first()
+    if not user:
+        user = User(
+            email=email, password=None, auth_provider='google',
+            username=google_name or email.split('@')[0]
+        )
+        db.session.add(user)
+        db.session.commit()
+    elif not user.username and google_name:
+        user.username = google_name
+        db.session.commit()
+
+    session['user_id'] = user.id
+    return redirect(url_for('home') if user.group_id else url_for('group'))
 
 
 @app.route('/register', methods=['GET', 'POST'])
@@ -635,10 +682,10 @@ def register():
         username = request.form.get('username', '').strip()
         if not email or not password:
             flash('Email and password required')
-            return render_template('register.html', google_client_id=GOOGLE_CLIENT_ID)
+            return render_template('register.html')
         if len(password) < 6:
             flash('Password must be at least 6 characters')
-            return render_template('register.html', google_client_id=GOOGLE_CLIENT_ID)
+            return render_template('register.html')
         existing_user = User.query.filter_by(email=email).first()
         if existing_user and existing_user.password and check_password_hash(existing_user.password, password):
             session['user_id'] = existing_user.id
@@ -658,7 +705,7 @@ def register():
         except IntegrityError:
             db.session.rollback()
             flash('Email already exists')
-    return render_template('register.html', google_client_id=GOOGLE_CLIENT_ID)
+    return render_template('register.html')
 
 
 @app.route('/logout')
