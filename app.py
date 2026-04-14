@@ -571,6 +571,18 @@ def preprocess_receipt_image(image_bytes):
 # AUTH ROUTES
 # =============================================================================
 
+@app.route('/debug-config')
+def debug_config():
+    """TEMPORARY: shows auth config so you can match Google Cloud Console. Remove after fix."""
+    return jsonify({
+        'client_id_set': bool(GOOGLE_CLIENT_ID),
+        'client_id_preview': (GOOGLE_CLIENT_ID[:12] + '...') if GOOGLE_CLIENT_ID else '',
+        'client_secret_set': bool(GOOGLE_CLIENT_SECRET),
+        'redirect_uri': GOOGLE_REDIRECT_URI,
+        'base_url': BASE_URL,
+    })
+
+
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     # Redirect already-authenticated users away from the login page
@@ -615,6 +627,17 @@ def auth_google_start():
 @app.route('/auth/google/callback')
 def auth_google_callback():
     """Step 2: Google redirects here with an authorization code."""
+    try:
+        return _handle_google_callback()
+    except Exception as e:
+        import traceback
+        print(f'Unhandled error in Google callback:\n{traceback.format_exc()}', file=sys.stderr)
+        flash('Google authentication failed (unexpected error — check server logs)')
+        return redirect(url_for('login'))
+
+
+def _handle_google_callback():
+    """Inner handler for Google OAuth callback — all exceptions bubble up."""
     error = request.args.get('error')
     if error:
         flash(f'Google login cancelled: {error}')
@@ -622,7 +645,8 @@ def auth_google_callback():
 
     # CSRF check
     state = request.args.get('state', '')
-    if state != session.pop('oauth_state', None):
+    stored_state = session.pop('oauth_state', None)
+    if not stored_state or state != stored_state:
         flash('Invalid OAuth state — please try again')
         return redirect(url_for('login'))
 
@@ -631,39 +655,43 @@ def auth_google_callback():
         flash('Google authentication failed: no code received')
         return redirect(url_for('login'))
 
+    if not GOOGLE_CLIENT_SECRET:
+        print('ERROR: GOOGLE_CLIENT_SECRET is not set', file=sys.stderr)
+        flash('Google login is misconfigured (missing client secret)')
+        return redirect(url_for('login'))
+
     # Exchange the code for tokens
-    try:
-        token_resp = http_requests.post(
-            'https://oauth2.googleapis.com/token',
-            data={
-                'code': code,
-                'client_id': GOOGLE_CLIENT_ID,
-                'client_secret': GOOGLE_CLIENT_SECRET,
-                'redirect_uri': GOOGLE_REDIRECT_URI,
-                'grant_type': 'authorization_code',
-            },
-            timeout=10,
-        )
-        token_resp.raise_for_status()
-        tokens = token_resp.json()
-    except Exception as e:
-        print(f'Google token exchange error: {e}', file=sys.stderr)
-        flash('Google authentication failed')
+    token_resp = http_requests.post(
+        'https://oauth2.googleapis.com/token',
+        data={
+            'code': code,
+            'client_id': GOOGLE_CLIENT_ID,
+            'client_secret': GOOGLE_CLIENT_SECRET,
+            'redirect_uri': GOOGLE_REDIRECT_URI,
+            'grant_type': 'authorization_code',
+        },
+        timeout=10,
+    )
+    print(f'Google token exchange status: {token_resp.status_code}', file=sys.stderr)
+    if not token_resp.ok:
+        print(f'Google token error body: {token_resp.text}', file=sys.stderr)
+        flash(f'Google authentication failed: {token_resp.json().get("error", "token error")}')
+        return redirect(url_for('login'))
+
+    tokens = token_resp.json()
+    if 'id_token' not in tokens:
+        print(f'Google token response missing id_token: {tokens}', file=sys.stderr)
+        flash('Google authentication failed: no id_token in response')
         return redirect(url_for('login'))
 
     # Verify and decode the ID token
-    try:
-        idinfo = google_id_token.verify_oauth2_token(
-            tokens['id_token'], google_requests.Request(), GOOGLE_CLIENT_ID
-        )
-        email = idinfo['email'].strip().lower()
-        google_name = idinfo.get('name', '').strip()
-        if not idinfo.get('email_verified', False):
-            flash('Google account email is not verified')
-            return redirect(url_for('login'))
-    except Exception as e:
-        print(f'Google ID token verification error: {e}', file=sys.stderr)
-        flash('Google authentication failed')
+    idinfo = google_id_token.verify_oauth2_token(
+        tokens['id_token'], google_requests.Request(), GOOGLE_CLIENT_ID
+    )
+    email = idinfo['email'].strip().lower()
+    google_name = idinfo.get('name', '').strip()
+    if not idinfo.get('email_verified', False):
+        flash('Google account email is not verified')
         return redirect(url_for('login'))
 
     # Find or create the user
