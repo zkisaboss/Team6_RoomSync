@@ -567,6 +567,18 @@ def preprocess_receipt_image(image_bytes):
 # AUTH ROUTES
 # =============================================================================
 
+@app.route('/debug-auth')
+def debug_auth():
+    """Temporary: confirms env vars are loaded. REMOVE AFTER FIXING."""
+    client_id = GOOGLE_CLIENT_ID
+    return jsonify({
+        'google_client_id_set': bool(client_id),
+        'google_client_id_preview': client_id[:20] + '...' if len(client_id) > 20 else client_id,
+        'env_var_NEXT_PUBLIC': bool(os.environ.get('NEXT_PUBLIC_GOOGLE_CLIENT_ID')),
+        'env_var_GOOGLE_CLIENT_ID': bool(os.environ.get('GOOGLE_CLIENT_ID')),
+    })
+
+
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     if request.method == 'POST':
