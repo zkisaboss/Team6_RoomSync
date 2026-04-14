@@ -8,6 +8,7 @@ import base64
 import io
 import atexit
 import requests as http_requests
+from urllib.parse import quote as url_quote
 
 from datetime import datetime, date, timedelta
 from functools import wraps
@@ -62,7 +63,7 @@ ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY')
 BASE_URL = os.environ.get('BASE_URL', 'http://localhost:5000')
 GOOGLE_CLIENT_ID = os.environ.get('NEXT_PUBLIC_GOOGLE_CLIENT_ID') or os.environ.get('GOOGLE_CLIENT_ID', '')
 GOOGLE_CLIENT_SECRET = os.environ.get('GOOGLE_CLIENT_SECRET', '')
-GOOGLE_REDIRECT_URI = os.environ.get('GOOGLE_REDIRECT_URI', f'{os.environ.get("BASE_URL", "http://localhost:5000")}/auth/google/callback')
+GOOGLE_REDIRECT_URI = os.environ.get('GOOGLE_REDIRECT_URI', f'{BASE_URL}/auth/google/callback')
 
 
 # =============================================================================
@@ -572,6 +573,11 @@ def preprocess_receipt_image(image_bytes):
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
+    # Redirect already-authenticated users away from the login page
+    if 'user_id' in session:
+        user = db.session.get(User, session['user_id'])
+        if user:
+            return redirect(url_for('home') if user.group_id else url_for('group'))
     if request.method == 'POST':
         email = request.form.get('email', '').strip().lower()
         password = request.form.get('password', '')
@@ -602,7 +608,7 @@ def auth_google_start():
         'state': state,
         'access_type': 'online',
     }
-    query = '&'.join(f'{k}={http_requests.utils.quote(str(v))}' for k, v in params.items())
+    query = '&'.join(f'{k}={url_quote(str(v))}' for k, v in params.items())
     return redirect(f'https://accounts.google.com/o/oauth2/v2/auth?{query}')
 
 
@@ -652,6 +658,9 @@ def auth_google_callback():
         )
         email = idinfo['email'].strip().lower()
         google_name = idinfo.get('name', '').strip()
+        if not idinfo.get('email_verified', False):
+            flash('Google account email is not verified')
+            return redirect(url_for('login'))
     except Exception as e:
         print(f'Google ID token verification error: {e}', file=sys.stderr)
         flash('Google authentication failed')
@@ -676,6 +685,11 @@ def auth_google_callback():
 
 @app.route('/register', methods=['GET', 'POST'])
 def register():
+    # Redirect already-authenticated users away from the register page
+    if 'user_id' in session:
+        user = db.session.get(User, session['user_id'])
+        if user:
+            return redirect(url_for('home') if user.group_id else url_for('group'))
     if request.method == 'POST':
         email = request.form.get('email', '').strip().lower()
         password = request.form.get('password', '')
