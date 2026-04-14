@@ -59,7 +59,7 @@ mail = Mail(app)
 stripe.api_key = os.environ.get("STRIPE_SECRET_KEY")
 ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY')
 BASE_URL = os.environ.get('BASE_URL', 'http://localhost:5000')
-GOOGLE_CLIENT_ID = os.environ.get('GOOGLE_CLIENT_ID', '')
+GOOGLE_CLIENT_ID = os.environ.get('NEXT_PUBLIC_GOOGLE_CLIENT_ID') or os.environ.get('GOOGLE_CLIENT_ID', '')
 
 
 # =============================================================================
