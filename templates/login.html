@@ -51,63 +51,91 @@
 <script>
     var googleClientId = '{{ google_client_id }}';
 
-    document.getElementById('google-signin-btn').addEventListener('click', function () {
-        if (typeof google === 'undefined' || !google.accounts) {
-            alert('Google Sign-In is still loading. Please try again in a moment.');
-            return;
+    // Wait for the GIS SDK to finish loading before allowing clicks
+    function waitForGoogle(callback, attempts) {
+        attempts = attempts || 0;
+        if (typeof google !== 'undefined' && google.accounts && google.accounts.id) {
+            callback();
+        } else if (attempts < 20) {
+            setTimeout(function () { waitForGoogle(callback, attempts + 1); }, 250);
+        } else {
+            alert('Google Sign-In failed to load. Please refresh and try again.');
         }
-        google.accounts.id.initialize({
-            client_id: googleClientId,
-            callback: function (response) {
-                var form = document.createElement('form');
-                form.method = 'POST';
-                form.action = '{{ url_for("auth_google") }}';
-                var input = document.createElement('input');
-                input.type = 'hidden';
-                input.name = 'credential';
-                input.value = response.credential;
-                form.appendChild(input);
-                document.body.appendChild(form);
-                form.submit();
-            }
-        });
-        google.accounts.id.prompt(function (notification) {
-            if (notification.isNotDisplayed() || notification.isSkippedMoment()) {
-                var container = document.createElement('div');
-                container.id = 'google-fallback-btn';
-                container.style.position = 'fixed';
-                container.style.top = '50%';
-                container.style.left = '50%';
-                container.style.transform = 'translate(-50%, -50%)';
-                container.style.zIndex = '10000';
-                container.style.background = 'white';
-                container.style.padding = '2rem';
-                container.style.borderRadius = '16px';
-                container.style.boxShadow = '0 8px 32px rgba(0,0,0,0.3)';
-                document.body.appendChild(container);
+    }
 
-                var overlay = document.createElement('div');
-                overlay.style.position = 'fixed';
-                overlay.style.top = '0';
-                overlay.style.left = '0';
-                overlay.style.width = '100%';
-                overlay.style.height = '100%';
-                overlay.style.background = 'rgba(0,0,0,0.5)';
-                overlay.style.zIndex = '9999';
-                overlay.onclick = function () {
-                    overlay.remove();
-                    container.remove();
-                };
-                document.body.appendChild(overlay);
+    // POST the credential token back to Flask
+    function handleGoogleCredential(response) {
+        var form = document.createElement('form');
+        form.method = 'POST';
+        form.action = '{{ url_for("auth_google") }}';
+        var input = document.createElement('input');
+        input.type = 'hidden';
+        input.name = 'credential';
+        input.value = response.credential;
+        form.appendChild(input);
+        document.body.appendChild(form);
+        form.submit();
+    }
 
-                google.accounts.id.renderButton(container, {
-                    theme: 'outline',
-                    size: 'large',
-                    width: 300,
-                    text: 'continue_with'
-                });
-            }
+    document.getElementById('google-signin-btn').addEventListener('click', function () {
+        waitForGoogle(function () {
+            // ux_mode: 'popup' prevents the gsi/transform blank-page redirect issue
+            google.accounts.id.initialize({
+                client_id: googleClientId,
+                callback: handleGoogleCredential,
+                ux_mode: 'popup',
+                auto_select: false,
+                cancel_on_tap_outside: true,
+            });
+
+            google.accounts.id.prompt(function (notification) {
+                // One Tap was suppressed — show a fallback modal with the rendered button
+                if (notification.isNotDisplayed() || notification.isSkippedMoment()) {
+                    showGoogleButtonModal();
+                }
+            });
         });
     });
+
+    function showGoogleButtonModal() {
+        var existing = document.getElementById('google-modal-overlay');
+        if (existing) existing.remove();
+
+        var overlay = document.createElement('div');
+        overlay.id = 'google-modal-overlay';
+        overlay.style.cssText = [
+            'position:fixed', 'top:0', 'left:0', 'width:100%', 'height:100%',
+            'background:rgba(0,0,0,0.5)', 'z-index:9999',
+            'display:flex', 'align-items:center', 'justify-content:center'
+        ].join(';');
+
+        var container = document.createElement('div');
+        container.style.cssText = [
+            'background:white', 'padding:2rem', 'border-radius:16px',
+            'box-shadow:0 8px 32px rgba(0,0,0,0.3)', 'min-width:280px', 'text-align:center'
+        ].join(';');
+
+        var title = document.createElement('p');
+        title.textContent = 'Sign in with Google';
+        title.style.cssText = 'margin:0 0 1rem;font-weight:600;color:#333;font-size:1rem;';
+        container.appendChild(title);
+
+        var btnDiv = document.createElement('div');
+        container.appendChild(btnDiv);
+        overlay.appendChild(container);
+        document.body.appendChild(overlay);
+
+        google.accounts.id.renderButton(btnDiv, {
+            type: 'standard',
+            theme: 'outline',
+            size: 'large',
+            width: 240,
+            text: 'continue_with',
+        });
+
+        overlay.addEventListener('click', function (e) {
+            if (e.target === overlay) overlay.remove();
+        });
+    }
 </script>
 {% endblock %}
