@@ -7,14 +7,16 @@ import json
 import base64
 import io
 import atexit
+import requests as http_requests
+from urllib.parse import quote as url_quote
 
 from datetime import datetime, date, timedelta
 from functools import wraps
 
-from flask import Flask, render_template, request, redirect, url_for, flash, session, jsonify
+from flask import Flask, render_template, request, redirect, url_for, flash, session, jsonify, g
 from flask_sqlalchemy import SQLAlchemy
 from flask_mail import Mail, Message
-from sqlalchemy.orm import relationship
+from sqlalchemy.orm import relationship, joinedload
 from sqlalchemy.exc import IntegrityError
 from werkzeug.security import generate_password_hash, check_password_hash
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps
@@ -59,7 +61,9 @@ mail = Mail(app)
 stripe.api_key = os.environ.get("STRIPE_SECRET_KEY")
 ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY')
 BASE_URL = os.environ.get('BASE_URL', 'http://localhost:5000')
-GOOGLE_CLIENT_ID = os.environ.get('GOOGLE_CLIENT_ID', '')
+GOOGLE_CLIENT_ID = os.environ.get('NEXT_PUBLIC_GOOGLE_CLIENT_ID') or os.environ.get('GOOGLE_CLIENT_ID', '')
+GOOGLE_CLIENT_SECRET = os.environ.get('GOOGLE_CLIENT_SECRET', '')
+GOOGLE_REDIRECT_URI = os.environ.get('GOOGLE_REDIRECT_URI', f'{BASE_URL}/auth/google/callback')
 
 
 # =============================================================================
@@ -151,7 +155,7 @@ class Notification(db.Model):
     is_read = db.Column(db.Boolean, default=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     related_id = db.Column(db.Integer, nullable=True)
-    users = relationship('User', backref='notifications')
+    user = relationship('User', backref='notifications')
 
 
 class Expense(db.Model):
@@ -221,10 +225,50 @@ class GroceryItem(db.Model):
 # =============================================================================
 
 def login_required(f):
+    """Requires login; loads the user into g.user. No group required."""
     @wraps(f)
     def wrap(*args, **kwargs):
         if 'user_id' not in session:
             return redirect(url_for('login'))
+        user = db.session.get(User, session['user_id'])
+        if not user:
+            session.clear()
+            return redirect(url_for('login'))
+        g.user = user
+        return f(*args, **kwargs)
+    return wrap
+
+
+def api_login_required(f):
+    """For JSON API routes: enforces login + group membership, loads g.user."""
+    @wraps(f)
+    def wrap(*args, **kwargs):
+        if 'user_id' not in session:
+            return jsonify({'error': 'Unauthorized'}), 401
+        user = db.session.get(User, session['user_id'])
+        if not user:
+            session.clear()
+            return jsonify({'error': 'Unauthorized'}), 401
+        if not user.group_id:
+            return jsonify({'error': 'No group'}), 403
+        g.user = user
+        return f(*args, **kwargs)
+    return wrap
+
+
+def page_login_required(f):
+    """For HTML page routes: enforces login + group membership, loads g.user."""
+    @wraps(f)
+    def wrap(*args, **kwargs):
+        if 'user_id' not in session:
+            return redirect(url_for('login'))
+        user = db.session.get(User, session['user_id'])
+        if not user:
+            session.clear()
+            return redirect(url_for('login'))
+        g.user = user
+        if not user.group_id:
+            return redirect(url_for('group'))
         return f(*args, **kwargs)
     return wrap
 
@@ -250,6 +294,7 @@ def is_group_admin(user):
 
     return membership is not None
 
+
 def display_name(user):
     """Return the user's display name: username if set, otherwise email prefix."""
     return user.username if user.username else user.email.split('@')[0]
@@ -259,9 +304,6 @@ def display_name(user):
 def inject_user():
     return dict(current_user=get_current_user())
 
-
-def require_group(user):
-    return None if user.group_id else redirect(url_for('group'))
 
 def create_notification(user_id, group_id, notif_type, title, message, related_id=None):
     notif = Notification(
@@ -423,7 +465,6 @@ def parse_receipt_with_claude(image_bytes):
     Each item:
     - "name": item name only (exclude codes/quantities)
     - "amt": quantity (parse from EA/QTY/@, default 1)
-    - "price": line total (not unit price)
     - "unit_price": price per single unit
     - "price": line total (qty × unit_price)
 
@@ -532,64 +573,133 @@ def preprocess_receipt_image(image_bytes):
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
+    # Redirect already-authenticated users away from the login page
+    if 'user_id' in session:
+        user = db.session.get(User, session['user_id'])
+        if user:
+            return redirect(url_for('home') if user.group_id else url_for('group'))
     if request.method == 'POST':
         email = request.form.get('email', '').strip().lower()
         password = request.form.get('password', '')
         if not email or not password:
             flash('Email and password required')
-            return render_template('login.html', google_client_id=GOOGLE_CLIENT_ID)
+            return render_template('login.html')
         user = User.query.filter_by(email=email).first()
         if user and user.password and check_password_hash(user.password, password):
             session['user_id'] = user.id
             return redirect(url_for('home') if user.group_id else url_for('group'))
         flash('Invalid credentials')
-    return render_template('login.html', google_client_id=GOOGLE_CLIENT_ID)
+    return render_template('login.html')
 
 
-@app.route('/auth/google', methods=['POST'])
-def auth_google():
-    """Handle Google Sign-In callback."""
-    token = request.form.get('credential')
-    if not token:
+@app.route('/auth/google')
+def auth_google_start():
+    """Step 1: Redirect the user to Google's OAuth2 consent screen."""
+    if not GOOGLE_CLIENT_ID:
+        flash('Google login is not configured')
+        return redirect(url_for('login'))
+    state = secrets.token_urlsafe(16)
+    session['oauth_state'] = state
+    params = {
+        'client_id': GOOGLE_CLIENT_ID,
+        'redirect_uri': GOOGLE_REDIRECT_URI,
+        'response_type': 'code',
+        'scope': 'openid email profile',
+        'state': state,
+        'access_type': 'online',
+    }
+    query = '&'.join(f'{k}={url_quote(str(v))}' for k, v in params.items())
+    return redirect(f'https://accounts.google.com/o/oauth2/v2/auth?{query}')
+
+
+@app.route('/auth/google/callback')
+def auth_google_callback():
+    """Step 2: Google redirects here with an authorization code."""
+    error = request.args.get('error')
+    if error:
+        flash(f'Google login cancelled: {error}')
+        return redirect(url_for('login'))
+
+    # CSRF check
+    state = request.args.get('state', '')
+    if state != session.pop('oauth_state', None):
+        flash('Invalid OAuth state — please try again')
+        return redirect(url_for('login'))
+
+    code = request.args.get('code')
+    if not code:
+        flash('Google authentication failed: no code received')
+        return redirect(url_for('login'))
+
+    # Exchange the code for tokens
+    try:
+        token_resp = http_requests.post(
+            'https://oauth2.googleapis.com/token',
+            data={
+                'code': code,
+                'client_id': GOOGLE_CLIENT_ID,
+                'client_secret': GOOGLE_CLIENT_SECRET,
+                'redirect_uri': GOOGLE_REDIRECT_URI,
+                'grant_type': 'authorization_code',
+            },
+            timeout=10,
+        )
+        token_resp.raise_for_status()
+        tokens = token_resp.json()
+    except Exception as e:
+        print(f'Google token exchange error: {e}', file=sys.stderr)
         flash('Google authentication failed')
         return redirect(url_for('login'))
+
+    # Verify and decode the ID token
     try:
         idinfo = google_id_token.verify_oauth2_token(
-            token, google_requests.Request(), GOOGLE_CLIENT_ID
+            tokens['id_token'], google_requests.Request(), GOOGLE_CLIENT_ID
         )
         email = idinfo['email'].strip().lower()
         google_name = idinfo.get('name', '').strip()
-        user = User.query.filter_by(email=email).first()
-        if not user:
-            user = User(
-                email=email, password=None, auth_provider='google',
-                username=google_name or email.split('@')[0]
-            )
-            db.session.add(user)
-            db.session.commit()
-        elif not user.username and google_name:
-            user.username = google_name
-            db.session.commit()
-        session['user_id'] = user.id
-        return redirect(url_for('home') if user.group_id else url_for('group'))
+        if not idinfo.get('email_verified', False):
+            flash('Google account email is not verified')
+            return redirect(url_for('login'))
     except Exception as e:
-        print(f'Google auth error: {e}', file=sys.stderr)
+        print(f'Google ID token verification error: {e}', file=sys.stderr)
         flash('Google authentication failed')
         return redirect(url_for('login'))
+
+    # Find or create the user
+    user = User.query.filter_by(email=email).first()
+    if not user:
+        user = User(
+            email=email, password=None, auth_provider='google',
+            username=google_name or email.split('@')[0]
+        )
+        db.session.add(user)
+        db.session.commit()
+    elif not user.username and google_name:
+        user.username = google_name
+        db.session.commit()
+
+    session['user_id'] = user.id
+    return redirect(url_for('home') if user.group_id else url_for('group'))
 
 
 @app.route('/register', methods=['GET', 'POST'])
 def register():
+    # Redirect already-authenticated users away from the register page
+    if 'user_id' in session:
+        user = db.session.get(User, session['user_id'])
+        if user:
+            return redirect(url_for('home') if user.group_id else url_for('group'))
     if request.method == 'POST':
         email = request.form.get('email', '').strip().lower()
         password = request.form.get('password', '')
         username = request.form.get('username', '').strip()
         if not email or not password:
             flash('Email and password required')
-            return render_template('register.html', google_client_id=GOOGLE_CLIENT_ID)
+            return render_template('register.html')
         if len(password) < 6:
             flash('Password must be at least 6 characters')
-            return render_template('register.html', google_client_id=GOOGLE_CLIENT_ID)
+            return render_template('register.html')
         existing_user = User.query.filter_by(email=email).first()
         if existing_user:
             if existing_user.password and check_password_hash(existing_user.password, password):
@@ -612,7 +722,7 @@ def register():
         except IntegrityError:
             db.session.rollback()
             flash('Email already exists')
-    return render_template('register.html', google_client_id=GOOGLE_CLIENT_ID)
+    return render_template('register.html')
 
 
 @app.route('/logout')
@@ -628,9 +738,7 @@ def logout():
 @app.route('/group', methods=['GET', 'POST'])
 @login_required
 def group():
-    user = get_current_user()
-    if not user:
-        return redirect(url_for('login'))
+    user = g.user
     if user.group_id:
         return redirect(url_for('home'))
     if request.method == 'POST':
@@ -644,8 +752,8 @@ def group():
 @app.route('/group/invite', methods=['POST'])
 @login_required
 def invite_to_group():
-    user = get_current_user()
-    if not user or not user.group_id:
+    user = g.user
+    if not user.group_id:
         return redirect(url_for('group'))
 
     email = request.form.get('email', '').strip().lower()
@@ -669,8 +777,8 @@ def invite_to_group():
 @app.route('/group/remove-member/<int:user_id>', methods=['POST'])
 @login_required
 def remove_member(user_id):
-    current_user = get_current_user()
-    if not current_user or not current_user.group_id:
+    current_user = g.user
+    if not current_user.group_id:
         return redirect(url_for('group'))
 
     if not is_group_admin(current_user):
@@ -777,50 +885,30 @@ def handle_join_group(user):
 # =============================================================================
 
 @app.route('/')
-@login_required
+@page_login_required
 def home():
-    user = get_current_user()
-    if not user:
-        return redirect(url_for('login'))
-    if redirect_response := require_group(user):
-        return redirect_response
-    return render_template('home.html', group=user.group)
+    return render_template('home.html', group=g.user.group)
 
 
 @app.route('/chores')
-@login_required
+@page_login_required
 def chores():
-    user = get_current_user()
-    if not user:
-        return redirect(url_for('login'))
-    if redirect_response := require_group(user):
-        return redirect_response
-    return render_template('chores.html', group=user.group)
+    return render_template('chores.html', group=g.user.group)
 
 
 @app.route('/groceries')
-@login_required
+@page_login_required
 def groceries():
-    user = get_current_user()
-    if not user:
-        return redirect(url_for('login'))
-    if redirect_response := require_group(user):
-        return redirect_response
-    items = GroceryItem.query.filter_by(group_id=user.group_id).order_by(
+    items = GroceryItem.query.filter_by(group_id=g.user.group_id).order_by(
         GroceryItem.purchased, GroceryItem.id.desc()
     ).all()
-    return render_template('groceries.html', group=user.group, items=items)
+    return render_template('groceries.html', group=g.user.group, items=items)
 
 
 @app.route('/expenses')
-@login_required
+@page_login_required
 def expenses():
-    user = get_current_user()
-    if not user:
-        return redirect(url_for('login'))
-    if redirect_response := require_group(user):
-        return redirect_response
-    return render_template('expenses.html', group=user.group)
+    return render_template('expenses.html', group=g.user.group)
 
 
 @app.route('/account')
@@ -830,14 +918,24 @@ def account():
     if not user:
         return redirect(url_for('login'))
     return render_template('account.html', user=user, display_name=display_name(user))
+    user = g.user
+    members = []
+    if user.group_id:
+        members = User.query.filter_by(group_id=user.group_id).all()
+
+    return render_template(
+        'account.html',
+        user=user,
+        display_name=display_name(user),
+        members=members,
+        is_admin=is_group_admin(user)
+    )
 
 
 @app.route('/account/update-username', methods=['POST'])
 @login_required
 def update_username():
-    user = get_current_user()
-    if not user:
-        return jsonify({'error': 'Unauthorized'}), 401
+    user = g.user
     data = request.get_json()
     new_username = data.get('username', '').strip() if data else ''
     if not new_username:
@@ -852,9 +950,7 @@ def update_username():
 @app.route('/account/update-email', methods=['POST'])
 @login_required
 def update_email():
-    user = get_current_user()
-    if not user:
-        return jsonify({'error': 'Unauthorized'}), 401
+    user = g.user
     data = request.get_json()
     new_email = data.get('email', '').strip().lower() if data else ''
     if not new_email or '@' not in new_email:
@@ -874,11 +970,8 @@ def update_email():
 # =============================================================================
 
 @app.route('/groceries/upload', methods=['POST'])
-@login_required
+@api_login_required
 def upload_receipt():
-    user = get_current_user()
-    if not user or not user.group_id:
-        return jsonify({'error': 'Unauthorized'}), 401
     try:
         image_bytes = extract_image_from_request()
         if not image_bytes:
@@ -894,11 +987,9 @@ def upload_receipt():
 
 
 @app.route('/groceries/add', methods=['POST'])
-@login_required
+@api_login_required
 def add_grocery():
-    user = get_current_user()
-    if not user or not user.group_id:
-        return jsonify({'error': 'Unauthorized'}), 401
+    user = g.user
     data = request.get_json()
     name = data.get('name', '').strip()
     if not name:
@@ -938,11 +1029,9 @@ def add_grocery():
 
 
 @app.route('/groceries/bulk-add', methods=['POST'])
-@login_required
+@api_login_required
 def bulk_add_groceries():
-    user = get_current_user()
-    if not user or not user.group_id:
-        return jsonify({'error': 'Unauthorized'}), 401
+    user = g.user
     data = request.get_json()
     added = []
     for item_data in data.get('items', []):
@@ -960,11 +1049,9 @@ def bulk_add_groceries():
 
 
 @app.route('/groceries/<int:item_id>', methods=['PUT', 'DELETE'])
-@login_required
+@api_login_required
 def modify_grocery(item_id):
-    user = get_current_user()
-    if not user or not user.group_id:
-        return jsonify({'error': 'Unauthorized'}), 401
+    user = g.user
     item = GroceryItem.query.filter_by(id=item_id, group_id=user.group_id).first()
     if not item:
         return jsonify({'error': 'Item not found'}), 404
@@ -1010,25 +1097,23 @@ def chore_to_dict(chore):
 
 
 @app.route("/api/users", methods=["GET"])
-@login_required
+@api_login_required
 def get_users():
-    user = get_current_user()
-    if not user or not user.group_id:
-        return jsonify([])
-    group_users = User.query.filter_by(group_id=user.group_id).all()
+    group_users = User.query.filter_by(group_id=g.user.group_id).all()
     return jsonify([{"user_id": u.id, "name": display_name(u)} for u in group_users])
 
 
 @app.route("/api/chores", methods=["GET", "POST"])
-@login_required
+@api_login_required
 def chores_api():
-    user = get_current_user()
-    if not user or not user.group_id:
-        return jsonify({'error': 'Unauthorized'}), 401
+    user = g.user
 
     if request.method == "GET":
         all_chores = Chore.query.filter_by(group_id=user.group_id).order_by(
             Chore.completed, Chore.next_due_date
+        ).options(
+            joinedload(Chore.assignments),
+            joinedload(Chore.completions).joinedload(ChoreCompletion.user),
         ).all()
         return jsonify([chore_to_dict(c) for c in all_chores])
 
@@ -1058,11 +1143,9 @@ def chores_api():
 
 
 @app.route("/api/chores/<int:chore_id>/complete", methods=["POST"])
-@login_required
+@api_login_required
 def complete_chore_route(chore_id):
-    user = get_current_user()
-    if not user or not user.group_id:
-        return jsonify({'error': 'Unauthorized'}), 401
+    user = g.user
     chore = Chore.query.filter_by(id=chore_id, group_id=user.group_id).first()
     if not chore:
         return jsonify({"error": "chore not found"}), 404
@@ -1073,16 +1156,17 @@ def complete_chore_route(chore_id):
 
 
 @app.route("/api/chores/<int:chore_id>/auto-assign", methods=["POST"])
-@login_required
+@api_login_required
 def auto_assign_chore_route(chore_id):
     user = get_current_user()
     if not user or not user.group_id:
         return jsonify({'error': 'Unauthorized'}), 401
     
+    user = g.user
     chore = Chore.query.filter_by(id=chore_id, group_id=user.group_id).first()
     if not chore:
         return jsonify({"error": "chore not found"}), 404
-    
+
     data = request.get_json() or {}
     completed_by_id = data.get("completedByUserID")
     completing_user = None
@@ -1116,21 +1200,28 @@ def auto_assign_chore_route(chore_id):
             )
     except Exception as e:
         print(f"Notification error (non-fatal): {e}", file=sys.stderr)
+    for member in group_members:
+        create_notification(
+            user_id=member.id,
+            group_id=member.group_id,
+            notif_type="chore",
+            title="Chore Rotated 🧹",
+            message=f'"{chore.name}" was completed by {display_name(completing_user)}' + (f' and is now assigned to {display_name(next_person)}.' if next_person else '.'),
+            related_id=chore_id
+        )
     db.session.commit()
     return jsonify(chore_to_dict(chore))
 
 
 @app.route("/api/chores/<int:chore_id>", methods=["DELETE"])
-@login_required
+@api_login_required
 def delete_chore(chore_id):
-    user = get_current_user()
-    if not user or not user.group_id:
-        return jsonify({"error": "Unauthorized"}), 401
+    user = g.user
 
     chore = Chore.query.filter_by(id=chore_id, group_id=user.group_id).first()
     if not chore:
         return jsonify({"error": "Chore not found"}), 404
-    
+
     chore_name = chore.name
     group_members = User.query.filter_by(group_id=user.group_id).all()
     try:
@@ -1145,6 +1236,15 @@ def delete_chore(chore_id):
             )
     except Exception as e:
         print(f"Notification error (non-fatal): {e}", file=sys.stderr)
+    for member in group_members:
+        create_notification(
+            user_id=member.id,
+            group_id=user.group_id,
+            notif_type="chore",
+            title="Chore Deleted 🧹",
+            message=f'"{chore_name}" was deleted by {display_name(user)}.',
+            related_id=chore_id
+        )
 
     db.session.delete(chore)
     db.session.commit()
@@ -1156,14 +1256,16 @@ def delete_chore(chore_id):
 # =============================================================================
 
 @app.route('/api/expenses', methods=['GET'])
-@login_required
+@api_login_required
 def get_expenses():
-    user = get_current_user()
-    if not user or not user.group_id:
-        return jsonify({'error': 'Unauthorized'}), 401
+    user = g.user
 
     all_expenses = Expense.query.filter_by(group_id=user.group_id).order_by(
         Expense.date.desc(), Expense.created_at.desc()
+    ).options(
+        joinedload(Expense.paid_by),
+        joinedload(Expense.splits).joinedload(ExpenseSplit.user),
+        joinedload(Expense.payments),
     ).all()
 
     return jsonify([{
@@ -1190,11 +1292,9 @@ def get_expenses():
 
 
 @app.route('/api/expenses', methods=['POST'])
-@login_required
+@api_login_required
 def create_expense():
-    user = get_current_user()
-    if not user or not user.group_id:
-        return jsonify({'error': 'Unauthorized'}), 401
+    user = g.user
 
     data = request.get_json()
     paid_by_user = User.query.filter_by(
@@ -1226,11 +1326,9 @@ def create_expense():
 
 
 @app.route('/api/expenses/<int:expense_id>', methods=['PUT'])
-@login_required
+@api_login_required
 def update_expense(expense_id):
-    user = get_current_user()
-    if not user or not user.group_id:
-        return jsonify({'error': 'Unauthorized'}), 401
+    user = g.user
 
     expense = Expense.query.filter_by(id=expense_id, group_id=user.group_id).first()
     if not expense:
@@ -1252,11 +1350,9 @@ def update_expense(expense_id):
 
 
 @app.route('/api/expenses/<int:expense_id>', methods=['DELETE'])
-@login_required
+@api_login_required
 def delete_expense(expense_id):
-    user = get_current_user()
-    if not user or not user.group_id:
-        return jsonify({'error': 'Unauthorized'}), 401
+    user = g.user
 
     expense = Expense.query.filter_by(id=expense_id, group_id=user.group_id).first()
     if not expense:
@@ -1268,11 +1364,9 @@ def delete_expense(expense_id):
 
 
 @app.route('/api/expenses/<int:expense_id>/remind/<int:user_id>', methods=['POST'])
-@login_required
+@api_login_required
 def send_expense_reminder(expense_id, user_id):
-    current_user = get_current_user()
-    if not current_user or not current_user.group_id:
-        return jsonify({'error': 'Unauthorized'}), 401
+    current_user = g.user
 
     expense = Expense.query.filter_by(id=expense_id, group_id=current_user.group_id).first()
     if not expense:
@@ -1313,11 +1407,9 @@ def send_expense_reminder(expense_id, user_id):
 # =============================================================================
 
 @app.route("/api/expenses/<int:expense_id>/pay", methods=["POST"])
-@login_required
+@api_login_required
 def pay_expense(expense_id):
-    user = get_current_user()
-    if not user or not user.group_id:
-        return jsonify({"error": "Unauthorized"}), 401
+    user = g.user
 
     expense = Expense.query.filter_by(id=expense_id, group_id=user.group_id).first()
     if not expense:
@@ -1393,11 +1485,9 @@ def pay_expense(expense_id):
 
 
 @app.route("/groceries/pay", methods=["POST"])
-@login_required
+@api_login_required
 def pay_groceries():
-    user = get_current_user()
-    if not user or not user.group_id:
-        return jsonify({"error": "Unauthorized"}), 401
+    user = g.user
 
     data = request.get_json()
     item_ids = data.get("item_ids", [])
@@ -1542,9 +1632,7 @@ def stripe_webhook():
 @app.route("/account/connect-stripe", methods=["POST"])
 @login_required
 def connect_stripe():
-    user = get_current_user()
-    if not user:
-        return jsonify({"error": "Unauthorized"}), 401
+    user = g.user
 
     try:
         # Create a Stripe Express connected account
@@ -1575,9 +1663,7 @@ def connect_stripe():
 @app.route("/account/stripe-callback")
 @login_required
 def stripe_callback():
-    user = get_current_user()
-    if not user:
-        return redirect(url_for("login"))
+    user = g.user
 
     if request.args.get("refresh"):
         # User needs to restart onboarding
@@ -1601,9 +1687,7 @@ def stripe_callback():
 @app.route("/account/disconnect-stripe", methods=["POST"])
 @login_required
 def disconnect_stripe():
-    user = get_current_user()
-    if not user:
-        return jsonify({"error": "Unauthorized"}), 401
+    user = g.user
 
     user.stripe_account_id = None
     db.session.commit()
@@ -1618,8 +1702,16 @@ def delete_account():
         return redirect(url_for("login"))
     
     GroupMember.query.filter_by(user_id=user.id).delete()
+    user = g.user
 
-    # Delete user's related data
+    # Clean up group membership and notifications before deleting
+    if user.group_id:
+        membership = GroupMember.query.filter_by(group_id=user.group_id, user_id=user.id).first()
+        if membership:
+            db.session.delete(membership)
+        user.group_id = None
+    Notification.query.filter_by(user_id=user.id).delete()
+
     db.session.delete(user)
     db.session.commit()
     session.clear()
@@ -1632,22 +1724,14 @@ def delete_account():
 # NOTIFICATION ROUTES
 #=============================================================================
 @app.route('/notifications')
-@login_required
+@page_login_required
 def notifications_page():
-    user = get_current_user()
-    if not user:
-        return redirect(url_for('login'))
-    if redirect_response := require_group(user):
-        return redirect_response
-    return render_template('notifications.html', group=user.group)
+    return render_template('notifications.html', group=g.user.group)
 
 @app.route('/api/notifications', methods=['GET'])
-@login_required
+@api_login_required
 def get_notifications():
-    user = get_current_user()
-    if not user or not user.group_id:
-        return jsonify({'error': 'Unauthorized'}), 401
-    notifs = Notification.query.filter_by(user_id=user.id).order_by(Notification.created_at.desc()).limit(50).all()
+    notifs = Notification.query.filter_by(user_id=g.user.id).order_by(Notification.created_at.desc()).limit(50).all()
     return jsonify([{
         'id': n.id, 'type': n.type, 'title': n.title,
         'message': n.message, 'is_read': n.is_read,
@@ -1656,19 +1740,15 @@ def get_notifications():
     } for n in notifs])
 
 @app.route('/api/notifications/unread-count', methods=['GET'])
-@login_required
+@api_login_required
 def get_unread_count():
-    user = get_current_user()
-    if not user or not user.group_id:
-        return jsonify({'count': 0})
-    count = Notification.query.filter_by(user_id=user.id, is_read=False).count()
+    count = Notification.query.filter_by(user_id=g.user.id, is_read=False).count()
     return jsonify({'count': count})
 
 @app.route('/api/notifications/<int:notif_id>/read', methods=['POST'])
-@login_required
+@api_login_required
 def mark_notification_read(notif_id):
-    user = get_current_user()
-    notif = Notification.query.filter_by(id=notif_id, user_id=user.id).first()
+    notif = Notification.query.filter_by(id=notif_id, user_id=g.user.id).first()
     if not notif:
         return jsonify({'error': 'Not found'}), 404
     notif.is_read = True
@@ -1676,24 +1756,21 @@ def mark_notification_read(notif_id):
     return jsonify({'success': True})
 
 @app.route('/api/notifications/read-all', methods=['POST'])
-@login_required
+@api_login_required
 def mark_all_read():
-    user = get_current_user()
-    if not user:
-        return jsonify({'error': 'Unauthorized'}), 401
-    Notification.query.filter_by(user_id=user.id, is_read=False).update({'is_read': True})
+    Notification.query.filter_by(user_id=g.user.id, is_read=False).update({'is_read': True})
     db.session.commit()
     return jsonify({'success': True})
 
 
 @app.route("/api/payments/summary", methods=["GET"])
-@login_required
+@api_login_required
 def get_payments_summary():
-    user = get_current_user()
-    if not user or not user.group_id:
-        return jsonify({"error": "Unauthorized"}), 401
+    user = g.user
 
-    expenses = Expense.query.filter_by(group_id=user.group_id).all()
+    expenses = Expense.query.filter_by(group_id=user.group_id).options(
+        joinedload(Expense.splits)
+    ).all()
 
     completed_payments = {
         (p.user_id, p.expense_id)

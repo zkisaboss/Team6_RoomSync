@@ -32,6 +32,7 @@ class TestAuth:
             'email': 'dupe@test.com',
             'password': 'password123'
         })
+        client.get('/logout')  # clear session so guard doesn't redirect
         resp = client.post('/register', data={
             'email': 'dupe@test.com',
             'password': 'differentpassword'
@@ -54,6 +55,7 @@ class TestAuth:
             'email': 'wrong@test.com',
             'password': 'password123'
         })
+        client.get('/logout')  # clear session so guard doesn't redirect
         resp = client.post('/login', data={
             'email': 'wrong@test.com',
             'password': 'wrongpassword'
@@ -98,6 +100,34 @@ class TestProtectedPages:
         assert data['success'] is True
         assert data['username'] == 'myname'
 
+    def test_update_email(self, auth_client):
+        resp = auth_client.post('/account/update-email',
+            json={'email': 'updated@test.com'},
+            content_type='application/json'
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data['success'] is True
+        assert data['email'] == 'updated@test.com'
+
+    def test_update_email_duplicate(self, client):
+        # Register first user then log out
+        client.post('/register', data={
+            'email': 'first@test.com', 'password': 'password123'
+        })
+        client.get('/logout')
+        # Register second user (already logged in after this)
+        client.post('/register', data={
+            'email': 'second@test.com', 'password': 'password123'
+        })
+        # Try to change to first user's email
+        resp = client.post('/account/update-email',
+            json={'email': 'first@test.com'},
+            content_type='application/json'
+        )
+        assert resp.status_code == 400
+        data = resp.get_json()
+        assert 'already in use' in data['error']
 
 
 class TestUnauthenticatedRedirects:
