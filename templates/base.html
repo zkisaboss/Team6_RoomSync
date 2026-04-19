@@ -755,14 +755,150 @@
             margin-top: 1rem;
         }
 
+        /* Mobile Nav Toggle */
+        .nav-toggle {
+            display: none;
+            background: none;
+            border: none;
+            cursor: pointer;
+            padding: 0.5rem;
+            border-radius: var(--radius-sm);
+            transition: background 0.2s;
+            position: relative;
+            width: 40px;
+            height: 40px;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .nav-toggle:hover {
+            background: var(--bg-subtle);
+        }
+
+        .nav-toggle-icon {
+            display: block;
+            width: 20px;
+            height: 2px;
+            background: var(--text-main);
+            border-radius: 2px;
+            position: relative;
+            transition: background 0.3s;
+        }
+
+        .nav-toggle-icon::before,
+        .nav-toggle-icon::after {
+            content: '';
+            display: block;
+            width: 20px;
+            height: 2px;
+            background: var(--text-main);
+            border-radius: 2px;
+            position: absolute;
+            left: 0;
+            transition: transform 0.3s, top 0.3s;
+        }
+
+        .nav-toggle-icon::before {
+            top: -6px;
+        }
+
+        .nav-toggle-icon::after {
+            top: 6px;
+        }
+
+        /* Animate hamburger to X */
+        .nav-toggle.active .nav-toggle-icon {
+            background: transparent;
+        }
+
+        .nav-toggle.active .nav-toggle-icon::before {
+            top: 0;
+            transform: rotate(45deg);
+        }
+
+        .nav-toggle.active .nav-toggle-icon::after {
+            top: 0;
+            transform: rotate(-45deg);
+        }
+
+        .nav-links {
+            display: flex;
+            align-items: center;
+        }
+
         /* Responsive */
-        @media (max-width: 600px) {
+        @media (max-width: 768px) {
             .container {
                 padding: 0 1rem;
             }
 
             .flex-row-responsive {
                 flex-direction: column;
+            }
+
+            .nav-toggle {
+                display: flex;
+            }
+
+            .nav-links {
+                display: none;
+                position: absolute;
+                top: 100%;
+                right: 0;
+                left: 0;
+                background: #FFFFFF;
+                border-bottom: 1px solid var(--border);
+                box-shadow: 0 8px 24px rgba(0, 0, 0, 0.08);
+                flex-direction: column;
+                padding: 0.5rem 0;
+                z-index: 99;
+            }
+
+            .nav-links.open {
+                display: flex;
+                animation: navSlideDown 0.25s ease-out;
+            }
+
+            .nav-links a {
+                margin-left: 0 !important;
+                padding: 0.85rem 2rem;
+                border-bottom: 1px solid var(--border);
+                font-size: 1rem;
+                width: 100%;
+                display: flex;
+                align-items: center;
+                gap: 0.5rem;
+            }
+
+            .nav-links a:last-child {
+                border-bottom: none;
+            }
+
+            .nav-links a:hover {
+                background: var(--bg-subtle);
+                color: var(--primary);
+            }
+
+            nav {
+                padding: 0.75rem 1rem;
+                position: relative;
+            }
+        }
+
+        @media (min-width: 769px) {
+            .nav-toggle {
+                display: none !important;
+            }
+        }
+
+        @keyframes navSlideDown {
+            from {
+                opacity: 0;
+                transform: translateY(-8px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
             }
         }
     </style>
@@ -777,12 +913,15 @@
             </a>
         </div>
         {% if session.user_id %}
-        <div>
+        <button class="nav-toggle" id="navToggle" aria-label="Toggle navigation">
+            <span class="nav-toggle-icon"></span>
+        </button>
+        <div class="nav-links" id="navLinks">
             {% if current_user and current_user.group_id %}
             <a href="{{ url_for('chores') }}">Chores</a>
             <a href="{{ url_for('groceries') }}">Groceries</a>
             <a href="{{ url_for('expenses') }}">Expenses</a>
-	    <a href="{{ url_for('notifications_page') }}">🔔 Notifications</a>
+            <a href="{{ url_for('notifications_page') }}">🔔 Notifications</a>
             {% endif %}
             <a href="{{ url_for('account') }}">Account</a>
         </div>
@@ -937,6 +1076,35 @@
                 this.renderMenu();
             }
         }
+
+        /* Mobile Nav Toggle */
+        (function() {
+            const toggle = document.getElementById('navToggle');
+            const links = document.getElementById('navLinks');
+            if (!toggle || !links) return;
+
+            toggle.addEventListener('click', function(e) {
+                e.stopPropagation();
+                toggle.classList.toggle('active');
+                links.classList.toggle('open');
+            });
+
+            // Close menu when clicking outside
+            document.addEventListener('click', function(e) {
+                if (!toggle.contains(e.target) && !links.contains(e.target)) {
+                    toggle.classList.remove('active');
+                    links.classList.remove('open');
+                }
+            });
+
+            // Close menu when a link is clicked
+            links.querySelectorAll('a').forEach(function(link) {
+                link.addEventListener('click', function() {
+                    toggle.classList.remove('active');
+                    links.classList.remove('open');
+                });
+            });
+        })();
     </script>
 </body>
 

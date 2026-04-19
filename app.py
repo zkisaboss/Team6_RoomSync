@@ -19,7 +19,7 @@ from flask_mail import Mail, Message
 from sqlalchemy.orm import relationship, joinedload
 from sqlalchemy.exc import IntegrityError
 from werkzeug.security import generate_password_hash, check_password_hash
-from PIL import Image, ImageEnhance, ImageFilter, ImageOps
+from PIL import Image, ImageEnhance, ImageOps
 from dotenv import load_dotenv
 import anthropic
 from apscheduler.schedulers.background import BackgroundScheduler
