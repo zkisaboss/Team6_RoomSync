@@ -1,32 +1,14 @@
 import os
 import sys
-import secrets
-import re
 import stripe
-import json
-import base64
-import io
-import atexit
-import requests as http_requests
-from urllib.parse import quote as url_quote
 
-from datetime import datetime, date, timedelta
-from functools import wraps
+from datetime import datetime, date
 
 from flask import Flask, render_template, request, redirect, url_for, flash, session, jsonify, g
 from flask_sqlalchemy import SQLAlchemy
 from flask_mail import Mail, Message
-from sqlalchemy.orm import relationship, joinedload
-from sqlalchemy.exc import IntegrityError
-from werkzeug.security import generate_password_hash, check_password_hash
-from PIL import Image, ImageEnhance, ImageOps
+from sqlalchemy.orm import relationship
 from dotenv import load_dotenv
-import anthropic
-from apscheduler.schedulers.background import BackgroundScheduler
-
-# Google Sign-In
-from google.oauth2 import id_token as google_id_token
-from google.auth.transport import requests as google_requests
 
 # Load environment variables
 load_dotenv()
@@ -223,6 +205,8 @@ class GroceryItem(db.Model):
 # =============================================================================
 # AUTH HELPERS
 # =============================================================================
+
+from functools import wraps
 
 def login_required(f):
     """Requires login; loads the user into g.user. No group required."""
@@ -435,6 +419,10 @@ def check_and_send_weekly_reminders():
 # SCHEDULER
 # =============================================================================
 
+import atexit
+from datetime import timedelta
+from apscheduler.schedulers.background import BackgroundScheduler
+
 scheduler = BackgroundScheduler()
 scheduler.add_job(
     func=check_and_send_weekly_reminders,
@@ -450,6 +438,13 @@ atexit.register(lambda: scheduler.shutdown())
 # =============================================================================
 # RECEIPT / CLAUDE HELPERS
 # =============================================================================
+
+import re
+import json
+import base64
+import io
+import anthropic
+from PIL import Image, ImageEnhance, ImageOps
 
 def parse_receipt_with_claude(image_bytes):
     """Parse receipt image using Anthropic Claude."""
@@ -570,6 +565,16 @@ def preprocess_receipt_image(image_bytes):
 # =============================================================================
 # AUTH ROUTES
 # =============================================================================
+
+import secrets
+from urllib.parse import quote as url_quote
+import requests as http_requests
+from werkzeug.security import generate_password_hash, check_password_hash
+from sqlalchemy.exc import IntegrityError
+
+# Google Sign-In
+from google.oauth2 import id_token as google_id_token
+from google.auth.transport import requests as google_requests
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
@@ -1068,6 +1073,8 @@ def modify_grocery(item_id):
 # =============================================================================
 # CHORES API ROUTES
 # =============================================================================
+
+from sqlalchemy.orm import joinedload
 
 def chore_to_dict(chore):
     return {
