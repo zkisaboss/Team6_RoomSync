@@ -41,11 +41,6 @@ db = SQLAlchemy(app)
 mail = Mail(app)
 
 stripe.api_key = os.environ.get("STRIPE_SECRET_KEY")
-ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY')
-BASE_URL = os.environ.get('BASE_URL', 'http://localhost:5000')
-GOOGLE_CLIENT_ID = os.environ.get('NEXT_PUBLIC_GOOGLE_CLIENT_ID') or os.environ.get('GOOGLE_CLIENT_ID', '')
-GOOGLE_CLIENT_SECRET = os.environ.get('GOOGLE_CLIENT_SECRET', '')
-GOOGLE_REDIRECT_URI = os.environ.get('GOOGLE_REDIRECT_URI', f'{BASE_URL}/auth/google/callback')
 
 
 # =============================================================================
@@ -289,22 +284,12 @@ def inject_user():
     return dict(current_user=get_current_user())
 
 
-def create_notification(user_id, group_id, notif_type, title, message, related_id=None):
-    notif = Notification(
-        user_id=user_id,
-        group_id=group_id,
-        type=notif_type,
-        title=title,
-        message=message,
-        related_id=related_id
-    )
-    db.session.add(notif)
-    return notif
-
 
 # =============================================================================
 # EMAIL HELPERS
 # =============================================================================
+
+BASE_URL = os.environ.get('BASE_URL', 'http://localhost:5000')
 
 def send_expense_reminder_email(debtor_email, debtor_name, creditor_name, amount, description):
     """Send a reminder email to someone who owes money."""
@@ -446,6 +431,8 @@ import io
 import anthropic
 from PIL import Image, ImageEnhance, ImageOps
 
+ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY')
+
 def parse_receipt_with_claude(image_bytes):
     """Parse receipt image using Anthropic Claude."""
     if not ANTHROPIC_API_KEY:
@@ -575,6 +562,10 @@ from sqlalchemy.exc import IntegrityError
 # Google Sign-In
 from google.oauth2 import id_token as google_id_token
 from google.auth.transport import requests as google_requests
+
+GOOGLE_CLIENT_ID = os.environ.get('NEXT_PUBLIC_GOOGLE_CLIENT_ID') or os.environ.get('GOOGLE_CLIENT_ID', '')
+GOOGLE_CLIENT_SECRET = os.environ.get('GOOGLE_CLIENT_SECRET', '')
+GOOGLE_REDIRECT_URI = os.environ.get('GOOGLE_REDIRECT_URI', f'{BASE_URL}/auth/google/callback')
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
@@ -737,6 +728,74 @@ def logout():
 # GROUP ROUTES
 # =============================================================================
 
+
+def handle_create_group(user):
+    name = request.form.get('name', '').strip()
+    if not name:
+        flash('Group name required')
+        return render_template('group.html')
+
+    for _ in range(5):
+        code = secrets.token_hex(4).upper()
+        new_group = Group(name=name, code=code)
+        try:
+            db.session.add(new_group)
+            db.session.flush()
+
+            user.group_id = new_group.id
+
+            db.session.add(GroupMember(
+                group_id=new_group.id,
+                user_id=user.id,
+                role='admin'
+            ))
+
+            db.session.commit()
+            flash(f'Group created! Code: {code}')
+            return redirect(url_for('home'))
+        except IntegrityError:
+            db.session.rollback()
+
+    flash('Failed to create group, try again')
+    return render_template('group.html')
+
+
+def handle_join_group(user):
+    code = request.form.get('code', '').strip().upper()
+    if not code:
+        flash('Group code required')
+        return render_template('group.html')
+
+    invite = GroupInvite.query.filter_by(code=code, accepted=False).first()
+
+    if not invite:
+        flash('Invalid or expired invite')
+        return render_template('group.html')
+
+    target_group = invite.group
+
+    try:
+        user.group_id = target_group.id
+
+
+        db.session.add(GroupMember(
+            group_id=target_group.id,
+            user_id=user.id,
+            role='member'
+        ))
+
+        invite.accepted = True
+
+        db.session.commit()
+        flash(f'Joined {target_group.name}!')
+        return redirect(url_for('home'))
+    except Exception:
+        db.session.rollback()
+        flash('Failed to join group')
+
+    return render_template('group.html')
+
+
 @app.route('/group', methods=['GET', 'POST'])
 @login_required
 def group():
@@ -813,73 +872,6 @@ def remove_member(user_id):
         flash('Failed to remove member')
 
     return redirect(url_for('account'))
-
-
-def handle_create_group(user):
-    name = request.form.get('name', '').strip()
-    if not name:
-        flash('Group name required')
-        return render_template('group.html')
-
-    for _ in range(5):
-        code = secrets.token_hex(4).upper()
-        new_group = Group(name=name, code=code)
-        try:
-            db.session.add(new_group)
-            db.session.flush()
-
-            user.group_id = new_group.id
-
-            db.session.add(GroupMember(
-                group_id=new_group.id,
-                user_id=user.id,
-                role='admin'
-            ))
-
-            db.session.commit()
-            flash(f'Group created! Code: {code}')
-            return redirect(url_for('home'))
-        except IntegrityError:
-            db.session.rollback()
-
-    flash('Failed to create group, try again')
-    return render_template('group.html')
-
-
-def handle_join_group(user):
-    code = request.form.get('code', '').strip().upper()
-    if not code:
-        flash('Group code required')
-        return render_template('group.html')
-
-    invite = GroupInvite.query.filter_by(code=code, accepted=False).first()
-
-    if not invite:
-        flash('Invalid or expired invite')
-        return render_template('group.html')
-
-    target_group = invite.group
-
-    try:
-        user.group_id = target_group.id
-
-
-        db.session.add(GroupMember(
-            group_id=target_group.id,
-            user_id=user.id,
-            role='member'
-        ))
-
-        invite.accepted = True
-
-        db.session.commit()
-        flash(f'Joined {target_group.name}!')
-        return redirect(url_for('home'))
-    except Exception:
-        db.session.rollback()
-        flash('Failed to join group')
-
-    return render_template('group.html')
 
 
 # =============================================================================
@@ -1073,6 +1065,20 @@ def modify_grocery(item_id):
 # =============================================================================
 # CHORES API ROUTES
 # =============================================================================
+
+
+def create_notification(user_id, group_id, notif_type, title, message, related_id=None):
+    notif = Notification(
+        user_id=user_id,
+        group_id=group_id,
+        type=notif_type,
+        title=title,
+        message=message,
+        related_id=related_id
+    )
+    db.session.add(notif)
+    return notif
+
 
 from sqlalchemy.orm import joinedload
 
