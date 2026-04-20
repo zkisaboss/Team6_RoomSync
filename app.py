@@ -424,11 +424,10 @@ atexit.register(lambda: scheduler.shutdown())
 # RECEIPT / CLAUDE HELPERS
 # =============================================================================
 
-import re
-import json
 import base64
 import io
 import anthropic
+from flask import json as flask_json
 from PIL import Image, ImageEnhance, ImageOps
 
 ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY')
@@ -474,19 +473,18 @@ def parse_receipt_with_claude(image_bytes):
 
     response_text = message.content[0].text
     try:
-        json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
-        if json_match:
-            data = json.loads(json_match.group())
-            return [
-                {
-                    'name': item.get('name', ''),
-                    'quantity': item.get('amt', 1),
-                    'unit_price': item.get('unit_price'),
-                    'price': item.get('price')
-                }
-                for item in data.get('items', [])
-            ]
-        return []
+        start = response_text.index('{')
+        end = response_text.rindex('}') + 1
+        data = flask_json.loads(response_text[start:end])
+        return [
+            {
+                'name': item.get('name', ''),
+                'quantity': item.get('amt', 1),
+                'unit_price': item.get('unit_price'),
+                'price': item.get('price')
+            }
+            for item in data.get('items', [])
+        ]
     except Exception as e:
         print(f"Error parsing Claude response: {e}", file=sys.stderr)
         return []
@@ -554,7 +552,7 @@ def preprocess_receipt_image(image_bytes):
 # =============================================================================
 
 import secrets
-from urllib.parse import quote as url_quote
+from urllib.parse import urlencode
 import requests as http_requests
 from werkzeug.security import generate_password_hash, check_password_hash
 from sqlalchemy.exc import IntegrityError
@@ -604,7 +602,7 @@ def auth_google_start():
         'state': state,
         'access_type': 'online',
     }
-    query = '&'.join(f'{k}={url_quote(str(v))}' for k, v in params.items())
+    query = urlencode(params)
     return redirect(f'https://accounts.google.com/o/oauth2/v2/auth?{query}')
 
 
