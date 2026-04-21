@@ -1200,15 +1200,7 @@ def auto_assign_chore_route(chore_id):
             )
     except Exception as e:
         print(f"Notification error (non-fatal): {e}", file=sys.stderr)
-    for member in group_members:
-        create_notification(
-            user_id=member.id,
-            group_id=member.group_id,
-            notif_type="chore",
-            title="Chore Rotated 🧹",
-            message=f'"{chore.name}" was completed by {display_name(completing_user)}' + (f' and is now assigned to {display_name(next_person)}.' if next_person else '.'),
-            related_id=chore_id
-        )
+
     db.session.commit()
     return jsonify(chore_to_dict(chore))
 
@@ -1236,16 +1228,7 @@ def delete_chore(chore_id):
             )
     except Exception as e:
         print(f"Notification error (non-fatal): {e}", file=sys.stderr)
-    for member in group_members:
-        create_notification(
-            user_id=member.id,
-            group_id=user.group_id,
-            notif_type="chore",
-            title="Chore Deleted 🧹",
-            message=f'"{chore_name}" was deleted by {display_name(user)}.',
-            related_id=chore_id
-        )
-
+        
     db.session.delete(chore)
     db.session.commit()
     return jsonify({"deleted": True})

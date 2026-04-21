@@ -124,7 +124,7 @@
 
   async function autoAssignChore(choreId) {
     const selectEl = document.getElementById(`complete-user-${choreId}`);
-    const completedByUserId = selectEl ? parseInt(selectEl.value, 10) || null : null;
+    const completedByUserId = (selectEl && selectEl.value) ? parseInt(selectEl.value, 10) : null;
     const res = await fetch(`${API_BASE}/${choreId}/auto-assign`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -132,6 +132,10 @@
     });
 
     if (res.ok) await fetchChores();
+    else {
+      const data = await res.json().catch(() => ({}));
+      alert(data.error || "Failed to rotate chore.");
+    }
   }
 
   
