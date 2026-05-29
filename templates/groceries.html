@@ -44,9 +44,24 @@
 
     <ul class="list-group mb-2" id="addItemSection">
         <li class="list-item" style="border-bottom: 2px solid var(--primary); padding-bottom: 1rem;">
-            <div class="flex-1">
+            <!-- Added the automatic suggestions to the dropdown menu -->
+            <div class="flex-1" style="position: relative; width: 100%;">
                 <input type="text" id="groceryName" name="name" placeholder="Add new item..." required
                     class="input-transparent w-100">
+                <div id="suggestionBox" style="
+                    display: none;
+                    position: absolute;
+                    top: 100%;
+                    left: 0;
+                    right: 0;
+                    background: var(--card-bg, #fff);
+                    border: 1px solid var(--border, #ddd);
+                    border-radius: 6px;
+                    box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+                    z-index: 100;
+                    max-height: 200px;
+                    overflow-y: auto;
+                "></div>
             </div>
             <div class="flex-row items-center" style="gap: 0.75rem;">
                 <div class="input-group">
@@ -486,6 +501,60 @@
 
         // Initialize
         updateTotals();
+
+        // Item prediction - adding the code to make sure it appears correctly on the groceries page
+        const suggestionBox = document.getElementById("suggestionBox");
+
+        const loadSuggestions = async (filter = "") => {
+            try {
+                const data = await api("/groceries/predict");
+                const filtered = filter
+                    ? data.suggestions.filter(s => s.name.toLowerCase().startsWith(filter.toLowerCase()))
+                    : data.suggestions;
+                
+                if (!filtered.length) {
+                    suggestionBox.style.display = "none";
+                    return;
+                }
+
+                suggestionBox.innerHTML = filter.map(s => `
+                    <div class="suggestion-item" data-name="${escapeHtml(s.name)}" style="
+                        padding: 0.5rem 0.75rem;
+                        cursor: pointer;
+                        font-size: 0.9rem;
+                        border-bottom: 1px solid var(--border, #eee);
+                        display: flex;
+                        justify-content: space-between;
+                        align-items: centerl
+                    ">
+                        <span>${escapeHtml(s.name)}</span>
+                        <span style="font-size:0.75rem; color: var(--muted, #999);">added ${s.frequency}x</span>
+                    </div>
+                `).join("");
+                suggestionBox.style.display = "block";
+            } catch (_) {}
+        };
+
+        el.addItemName.addEventListener("focus", () => loadSuggesions());
+        el.addItemName.addEvenetListener("input", (e) => {
+            const val = e.target.value.trim();
+            if (val.length === 0) loadSuggestions();
+            else loadSuggestions(val);
+        });
+
+        suggestionBox.addEventListener("click", (e) => {
+            const item = e.target.closest(".suggestion-item");
+            if (!item) return;
+            el.addItemName.value = item.dataset.name;
+            suggestionBox.style.display = "none";
+            el.addItemName.focus();
+        });
+
+        document.addEventListener("click", (e) => {
+            if (!el.addItemName.contains(e.target) && !suggestionBox.contains(e.target)) {
+                suggestionBox.style.display = "none";
+            }
+        });
     })();
 </script>
 {% endblock %}
