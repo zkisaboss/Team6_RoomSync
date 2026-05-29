@@ -10,7 +10,7 @@ import atexit
 import requests as http_requests
 from urllib.parse import quote as url_quote
 
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 from functools import wraps
 
 from flask import Flask, render_template, request, redirect, url_for, flash, session, jsonify, g
@@ -18,6 +18,7 @@ from flask_sqlalchemy import SQLAlchemy
 from flask_mail import Mail, Message
 from sqlalchemy.orm import relationship, joinedload
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy import func
 from werkzeug.security import generate_password_hash, check_password_hash
 from PIL import Image, ImageEnhance, ImageOps
 from dotenv import load_dotenv
@@ -134,6 +135,9 @@ class Chore(db.Model):
         backref=db.backref('assigned_chores', lazy=True))
     completions = db.relationship('ChoreCompletion', backref='chore', lazy=True,
         cascade="all, delete-orphan")
+    current_assignee_index = db.Column(db.Integer, default=0)
+    rotation_frequency_days = db.Column(db.Integer, nullable=True)
+    last_rotated_at = db.Column(db.DateTime, nullable=True)
 
 
 class ChoreCompletion(db.Model):
@@ -317,6 +321,22 @@ def create_notification(user_id, group_id, notif_type, title, message, related_i
     db.session.add(notif)
     return notif
 
+def rotate_chore_assignment(chore):
+    """Advance to the next assigned user in the rotation."""
+    if not chore.assignments:
+        return
+    chore.current_assignee_index = ((chore.current_assignee_index or 0) + 1) % len(chore.assignments)
+    chore.last_rotated_at = datetime.utcnow()
+    next_user = chore.assignments[chore.current_assignee_index]
+    create_notification(
+        user_id=next_user.id,
+        group_id=chore.group_id,
+        notif_type='chore_rotation',
+        title='Chore Assigned',
+        message=f"It's your turn: {chore.name}",
+        related_id=chore.id
+    )
+
 
 # =============================================================================
 # EMAIL HELPERS
@@ -430,6 +450,19 @@ def check_and_send_weekly_reminders():
             traceback.print_exc()
             db.session.rollback()
 
+def auto_rotate_chores():
+    """Nightly job - auto-rotate chores whose rotation interval has elapsed."""
+    with app.app_context():
+        now = datetime.utcnow()
+        chores = Chore.query.filter(Chore.rotation_frequency_days.isnot(None)).all()
+        for chore in chores:
+            if not chore.assignments:
+                continue
+            last = chore.last_rotated_at or datetime(2000, 1, 1)
+            if now >= last + timedelta(days=chore.rotation_frequency_days):
+                rotate_chore_assignment(chore)
+        db.session.commit()
+
 
 # =============================================================================
 # SCHEDULER
@@ -442,6 +475,13 @@ scheduler.add_job(
     hour=9,
     minute=0,
     id='weekly_expense_reminders'
+)
+scheduler.add_job(
+    func=auto_rotate_chores,
+    trigger='cron',
+    hour=0,
+    minute=5,
+    id='auto_rotate_chores'
 )
 scheduler.start()
 atexit.register(lambda: scheduler.shutdown())
@@ -1071,6 +1111,26 @@ def modify_grocery(item_id):
     db.session.commit()
     return jsonify({'updated': True})
 
+@app.route("/groceries/predict", methods=["GET"])
+@api_login_required
+def predict_grocery_items():
+    """Returns frequently bought items not currently on the list."""
+    all_items = db.session.query(
+        GroceryItem.name,
+        func.count(GroceryItem.id).label('frequency')
+    ).filter_by(group_id=g.user.group_id)\
+     .group_by(GroceryItem.name)\
+     .order_by(func.count(GroceryItem.id).desc())\
+     .limit(20).all()
+    current = {i.name.lower() for i in GroceryItem.query.filter_by(group_id=g.user.group_id, purchased=False).all()}
+
+    suggestions = [
+        {'name': name, 'frequency': freq}
+        for name, freq in all_items
+        if name.lower() not in current
+    ][:8]
+    return jsonify({'suggestions': suggestions})
+
 
 # =============================================================================
 # CHORES API ROUTES
@@ -1134,7 +1194,8 @@ def chores_api():
         group_id=user.group_id,
         created_by_id=user.id,
         next_due_date=next_due,
-        completed=False
+        completed=False,
+        rotation_frequency_days=int(data['rotationFrequencyDays']) if data.get('rotationFrequencyDays') else None
     )
     chore.assignments.extend(assigned_users)
     db.session.add(chore)
@@ -1201,6 +1262,17 @@ def auto_assign_chore_route(chore_id):
     except Exception as e:
         print(f"Notification error (non-fatal): {e}", file=sys.stderr)
 
+    db.session.commit()
+    return jsonify(chore_to_dict(chore))
+
+@app.route("/api/chores/<int:chore_id>/rotate", methods=["POST"])
+@api_login_required
+def rotate_chore_route(chore_id):
+    """Manually rotate - same logic the button calls."""
+    chore = Chore.query.filter_by(id=chore_id, group_id=g.user.group_id).first()
+    if not chore:
+        return jsonify({"error": "Chore not found"}), 404
+    rotate_chore_assignment(chore)
     db.session.commit()
     return jsonify(chore_to_dict(chore))
 
@@ -1848,6 +1920,23 @@ with app.app_context():
             conn.execute(db.text(
                 "ALTER TABLE users ADD COLUMN username VARCHAR(50)"
             ))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+        
+        # Automatically rotate chores to the next person in the list
+        try:
+            conn.execute(db.text("ALTER TABLE chores ADD COLUMN current_assginee_index INTEGER DEFAULT 0"))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+        try:
+            conn.execute(db.text("ALTER TABLE chores ADD COLUMN rotation_frequency_days INTEGER"))
+            conn.commit(0)
+        except Exception:
+            conn.rollback()
+        try:
+            conn.execute(db.text("ALTER TABLE chores ADD COLUMN last_rotated_at TIMESTAMP"))
             conn.commit()
         except Exception:
             conn.rollback()
