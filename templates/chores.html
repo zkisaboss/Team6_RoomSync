@@ -21,6 +21,15 @@
       <label for="chore-due">Due Date</label>
       <input id="chore-due" type="date" class="form-input" />
     </div>
+    <div class="form-group flex-1">
+      <label for="chore-frequency">Auto-Rotate</label>
+      <select id="chore-frequency" class="form-input">
+        <option value="">Manual Only</option>
+        <option value="7">Weekly</option>
+        <option value="14">BiWeekly</option>
+        <option value="30">Monthly</option>
+      </select>
+    </div>
     <div class="form-group flex-2">
       <label>Assign To</label>
       <div id="assign-dropdown-container"></div>
@@ -90,6 +99,7 @@
     const name = nameInput.value.trim();
     const nextDueBy = dueInput.value || null;
     const assignedUserIds = assignDropdown ? assignDropdown.getSelectedValues() : [];
+    const rotationFrequencyDays = document.getElementById("chore-frequency")?.value || null;
 
     if (!name) return;
 
@@ -97,6 +107,7 @@
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name, nextDueBy, assignedUserIds }),
+      body: JSON.stringify({ name, nextDueBy, assignedUserIds, rotationFrequencyDays }),
     });
 
     if (res.ok) {
